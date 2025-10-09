@@ -7,7 +7,6 @@ import sqlalchemy
 from sqlalchemy import text
 from testcontainers.oracle import OracleDbContainer
 
-from app.model.validator import rules
 from tests.conftest import file_path
 
 pytestmark = pytest.mark.oracle
@@ -20,6 +19,7 @@ oracle_database = "FREEPDB1"
 manifest = {
     "catalog": "my_catalog",
     "schema": "my_schema",
+    "dataSource": "oracle",
     "models": [
         {
             "name": "Orders",
@@ -121,12 +121,40 @@ def oracle(request) -> OracleDbContainer:
         "gvenzl/oracle-free:23.6-slim-faststart", oracle_password=f"{oracle_password}"
     ).start()
     engine = sqlalchemy.create_engine(oracle.get_connection_url())
+    orders_schema = {
+        "o_orderkey": sqlalchemy.Integer(),
+        "o_custkey": sqlalchemy.Integer(),
+        "o_orderstatus": sqlalchemy.Text(),
+        "o_totalprice": sqlalchemy.DECIMAL(precision=38, scale=2),
+        "o_orderdate": sqlalchemy.Date(),
+        "o_orderpriority": sqlalchemy.Text(),
+        "o_clerk": sqlalchemy.Text(),
+        "o_shippriority": sqlalchemy.Integer(),
+        "o_comment": sqlalchemy.Text(),
+    }
+    customer_schema = {
+        "c_custkey": sqlalchemy.Integer(),
+        "c_name": sqlalchemy.Text(),
+        "c_address": sqlalchemy.Text(),
+        "c_nationkey": sqlalchemy.Integer(),
+        "c_phone": sqlalchemy.Text(),
+        "c_acctbal": sqlalchemy.DECIMAL(precision=38, scale=2),
+        "c_mktsegment": sqlalchemy.Text(),
+        "c_comment": sqlalchemy.Text(),
+    }
     with engine.begin() as conn:
+        # assign dtype to avoid to create CLOB column for text columns
         pd.read_parquet(file_path("resource/tpch/data/orders.parquet")).to_sql(
-            "orders", engine, index=False
+            "orders",
+            engine,
+            index=False,
+            dtype=orders_schema,
         )
         pd.read_parquet(file_path("resource/tpch/data/customer.parquet")).to_sql(
-            "customer", engine, index=False
+            "customer",
+            engine,
+            index=False,
+            dtype=customer_schema,
         )
 
         # Create a table with a large CLOB column
@@ -139,7 +167,7 @@ def oracle(request) -> OracleDbContainer:
         # Add table and column comments
         conn.execute(text("COMMENT ON TABLE orders IS 'This is a table comment'"))
         conn.execute(text("COMMENT ON COLUMN orders.o_comment IS 'This is a comment'"))
-
+    request.addfinalizer(oracle.stop)
     return oracle
 
 
@@ -162,24 +190,24 @@ async def test_query(client, manifest_str, oracle: OracleDbContainer):
         370,
         "O",
         "172799.49",
-        "1996-01-02 00:00:00.000000",
+        "1996-01-02",
         "1_370",
         "2024-01-01 23:59:59.000000",
-        "2024-01-01 23:59:59.000000 UTC",
+        "2024-01-01 23:59:59.000000 +00:00",
         None,
         "616263",
     ]
     assert result["dtypes"] == {
         "orderkey": "int64",
         "custkey": "int64",
-        "orderstatus": "object",
-        "totalprice": "object",
-        "orderdate": "object",
-        "order_cust_key": "object",
-        "timestamp": "object",
-        "timestamptz": "object",
-        "test_null_time": "datetime64[ns]",
-        "blob_column": "object",
+        "orderstatus": "string",
+        "totalprice": "decimal128(38, 9)",
+        "orderdate": "date32[day]",
+        "order_cust_key": "string",
+        "timestamp": "timestamp[ns]",
+        "timestamptz": "timestamp[ns, tz=UTC]",
+        "test_null_time": "timestamp[us]",
+        "blob_column": "binary",
     }
 
 
@@ -288,98 +316,6 @@ async def test_query_with_dry_run_and_invalid_sql(
     )  # Oracle ORA-00942 Error: Table or view does not exist
 
 
-async def test_validate_with_unknown_rule(
-    client, manifest_str, oracle: OracleDbContainer
-):
-    connection_info = _to_connection_info(oracle)
-    response = await client.post(
-        url=f"{base_url}/validate/unknown_rule",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 404
-    assert (
-        response.text == f"The rule `unknown_rule` is not in the rules, rules: {rules}"
-    )
-
-
-async def test_validate_rule_column_is_valid(
-    client, manifest_str, oracle: OracleDbContainer
-):
-    connection_info = _to_connection_info(oracle)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 204
-
-
-async def test_validate_rule_column_is_valid_with_invalid_parameters(
-    client, manifest_str, oracle: OracleDbContainer
-):
-    connection_info = _to_connection_info(oracle)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={"connectionInfo": connection_info, "manifestStr": manifest_str},
-    )
-    assert response.status_code == 422
-    result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "parameters"]
-    assert result["detail"][0]["msg"] == "Field required"
-
-
-async def test_validate_rule_column_is_valid_without_parameters(
-    client, manifest_str, oracle: OracleDbContainer
-):
-    connection_info = _to_connection_info(oracle)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={"connectionInfo": connection_info, "manifestStr": manifest_str},
-    )
-    assert response.status_code == 422
-    result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "parameters"]
-    assert result["detail"][0]["msg"] == "Field required"
-
-
-async def test_validate_rule_column_is_valid_without_one_parameter(
-    client, manifest_str, oracle: OracleDbContainer
-):
-    connection_info = _to_connection_info(oracle)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `columnName`"
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `modelName`"
-
-
 async def test_metadata_list_tables(client, oracle: OracleDbContainer):
     connection_info = _to_connection_info(oracle)
     response = await client.post(
@@ -480,7 +416,10 @@ async def test_model_substitute(
         },
     )
     assert response.status_code == 422
-    assert response.text == 'Ambiguous model: found multiple matches for "ORDERS"'
+    assert (
+        response.json()["message"]
+        == 'Ambiguous model: found multiple matches for "ORDERS"'
+    )
 
 
 def _to_connection_info(oracle: OracleDbContainer):

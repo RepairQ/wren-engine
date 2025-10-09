@@ -1,21 +1,33 @@
 use datafusion::prelude::SessionContext;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wren_core::mdl::builder::{
     ColumnBuilder, ManifestBuilder, ModelBuilder, RelationshipBuilder,
 };
+use wren_core::mdl::context::Mode;
 use wren_core::mdl::manifest::{JoinType, Manifest};
 use wren_core::mdl::{transform_sql_with_ctx, AnalyzedWrenMDL};
 
 #[tokio::main]
 async fn main() -> datafusion::common::Result<()> {
     let manifest = init_manifest();
-    let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(manifest)?);
+    let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+        manifest,
+        Arc::new(HashMap::default()),
+        Mode::Unparse,
+    )?);
 
     let sql = "select customer_state from wrenai.public.orders_model";
-    println!("Original SQL: \n{}", sql);
-    let sql =
-        transform_sql_with_ctx(&SessionContext::new(), analyzed_mdl, &[], sql).await?;
-    println!("Wren engine generated SQL: \n{}", sql);
+    println!("Original SQL: \n{sql}");
+    let sql = transform_sql_with_ctx(
+        &SessionContext::new(),
+        analyzed_mdl,
+        &[],
+        HashMap::new().into(),
+        sql,
+    )
+    .await?;
+    println!("Wren engine generated SQL: \n{sql}");
     Ok(())
 }
 

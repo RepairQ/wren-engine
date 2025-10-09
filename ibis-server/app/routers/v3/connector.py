@@ -1,5 +1,6 @@
 from typing import Annotated
 
+import duckdb
 from fastapi import APIRouter, Depends, Query, Response
 from fastapi.responses import ORJSONResponse
 from loguru import logger
@@ -7,7 +8,16 @@ from opentelemetry import trace
 from starlette.datastructures import Headers
 
 from app.config import get_config
-from app.dependencies import get_wren_headers, verify_query_dto
+from app.dependencies import (
+    X_CACHE_CREATE_AT,
+    X_CACHE_HIT,
+    X_CACHE_OVERRIDE,
+    X_CACHE_OVERRIDE_AT,
+    X_WREN_FALLBACK_DISABLE,
+    get_wren_headers,
+    is_backward_compatible,
+    verify_query_dto,
+)
 from app.mdl.core import get_session_context
 from app.mdl.java_engine import JavaEngineConnector
 from app.mdl.rewriter import Rewriter
@@ -20,17 +30,26 @@ from app.model import (
 )
 from app.model.connector import Connector
 from app.model.data_source import DataSource
+from app.model.error import DatabaseTimeoutError
 from app.model.validator import Validator
 from app.query_cache import QueryCacheManager
 from app.routers import v2
 from app.routers.v2.connector import get_java_engine_connector, get_query_cache_manager
-from app.util import build_context, pushdown_limit, to_json
+from app.util import (
+    append_fallback_context,
+    build_context,
+    execute_dry_run_with_timeout,
+    execute_query_with_timeout,
+    execute_validate_with_timeout,
+    pushdown_limit,
+    safe_strtobool,
+    set_attribute,
+    to_json,
+    update_response_headers,
+)
 
 router = APIRouter(prefix="/connector", tags=["connector"])
 tracer = trace.get_tracer(__name__)
-
-MIGRATION_MESSAGE = "Wren engine is migrating to Rust version now. \
-    Wren AI team are appreciate if you can provide the error messages and related logs for us."
 
 
 @router.post(
@@ -65,14 +84,27 @@ async def query(
     with tracer.start_as_current_span(
         name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
     ) as span:
+        set_attribute(headers, span)
+        connection_info = data_source.get_connection_info(
+            dto.connection_info, dict(headers)
+        )
+        # Convert headers to dict for cache manager
+        headers_dict = dict(headers) if headers else None
+
         try:
-            sql = pushdown_limit(dto.sql, limit)
-            rewritten_sql = await Rewriter(
-                dto.manifest_str, data_source=data_source, experiment=True
-            ).rewrite(sql)
-            connector = Connector(data_source, dto.connection_info)
             if dry_run:
-                connector.dry_run(rewritten_sql)
+                sql = pushdown_limit(dto.sql, limit)
+                rewritten_sql = await Rewriter(
+                    dto.manifest_str,
+                    data_source=data_source,
+                    experiment=True,
+                    properties=dict(headers),
+                ).rewrite(sql)
+                connector = Connector(data_source, connection_info)
+                await execute_dry_run_with_timeout(
+                    connector,
+                    rewritten_sql,
+                )
                 return Response(status_code=204)
 
             # Not a dry run
@@ -82,95 +114,169 @@ async def query(
 
             if cache_enable:
                 cached_result = query_cache_manager.get(
-                    data_source, dto.sql, dto.connection_info
+                    data_source, dto.sql, connection_info, headers_dict
                 )
                 cache_hit = cached_result is not None
 
-            match (cache_enable, cache_hit, override_cache):
-                # case 1 cache hit read
-                case (True, True, False):
-                    span.add_event("cache hit")
-                    response = ORJSONResponse(to_json(cached_result))
-                    response.headers["X-Cache-Hit"] = "true"
-                    response.headers["X-Cache-Create-At"] = str(
-                        query_cache_manager.get_cache_file_timestamp(
-                            data_source, dto.sql, dto.connection_info
-                        )
+            cache_headers = {}
+            # case 1: cache hit read
+            if cache_enable and cache_hit and not override_cache:
+                span.add_event("cache hit")
+                result = cached_result
+                cache_headers[X_CACHE_HIT] = "true"
+                cache_headers[X_CACHE_CREATE_AT] = str(
+                    query_cache_manager.get_cache_file_timestamp(
+                        data_source, dto.sql, connection_info, headers_dict
                     )
-                # case 2 cache hit but override cache
-                case (True, True, True):
-                    result = connector.query(rewritten_sql, limit=limit)
-                    response = ORJSONResponse(to_json(result))
-                    # because we override the cache, so we need to set the cache hit to false
-                    response.headers["X-Cache-Hit"] = "false"
-                    response.headers["X-Cache-Create-At"] = str(
+                )
+            # all other cases require rewriting + connecting
+            else:
+                sql = pushdown_limit(dto.sql, limit)
+                rewritten_sql = await Rewriter(
+                    dto.manifest_str,
+                    data_source=data_source,
+                    experiment=True,
+                    properties=dict(headers),
+                ).rewrite(sql)
+                connector = Connector(data_source, connection_info)
+                result = await execute_query_with_timeout(
+                    connector,
+                    rewritten_sql,
+                )
+
+                # headers for all non-hit cases
+                cache_headers[X_CACHE_HIT] = "false"
+
+                if cache_enable and cache_hit and override_cache:
+                    # case 2: override existing cache
+                    cache_headers[X_CACHE_CREATE_AT] = str(
                         query_cache_manager.get_cache_file_timestamp(
-                            data_source, dto.sql, dto.connection_info
+                            data_source,
+                            dto.sql,
+                            connection_info,
+                            headers_dict,
                         )
                     )
                     query_cache_manager.set(
-                        data_source, dto.sql, result, dto.connection_info
+                        data_source,
+                        dto.sql,
+                        result,
+                        connection_info,
+                        headers_dict,
                     )
-                    response.headers["X-Cache-Override"] = "true"
-                    response.headers["X-Cache-Override-At"] = str(
+                    cache_headers[X_CACHE_OVERRIDE] = "true"
+                    cache_headers[X_CACHE_OVERRIDE_AT] = str(
                         query_cache_manager.get_cache_file_timestamp(
-                            data_source, dto.sql, dto.connection_info
+                            data_source,
+                            dto.sql,
+                            connection_info,
+                            headers_dict,
                         )
                     )
-                # case 3 and  case 4 cache miss read (first time cache read need to create cache)
-                # no matter the cache override or not, we need to create cache
-                case (True, False, _):
-                    result = connector.query(rewritten_sql, limit=limit)
-
-                    # set cache
+                elif cache_enable and not cache_hit:
+                    # case 3/4: cache miss but enabled (need to create cache)
+                    # no matter the cache override or not, we need to create cache
                     query_cache_manager.set(
-                        data_source, dto.sql, result, dto.connection_info
+                        data_source,
+                        dto.sql,
+                        result,
+                        connection_info,
+                        headers_dict,
                     )
-                    response = ORJSONResponse(to_json(result))
-                    response.headers["X-Cache-Hit"] = "false"
-                # case 5~8 Other cases (cache is not enabled)
-                case (False, _, _):
-                    result = connector.query(rewritten_sql, limit=limit)
-                    response = ORJSONResponse(to_json(result))
-                    response.headers["X-Cache-Hit"] = "false"
+                elif not cache_enable:
+                    # case 5~8 Other cases (cache is not enabled)
+                    pass
 
+            response = ORJSONResponse(to_json(result, headers, data_source=data_source))
+            update_response_headers(response, cache_headers)
             return response
+        except DatabaseTimeoutError:
+            # won't fallback to v2 if timeout
+            raise
         except Exception as e:
+            is_fallback_disable = bool(
+                headers.get(X_WREN_FALLBACK_DISABLE)
+                and safe_strtobool(headers.get(X_WREN_FALLBACK_DISABLE, "false"))
+            )
+            # because the v2 API doesn't support row-level access control,
+            # we don't fallback to v2 if the header include row-level access control properties.
+            if (
+                java_engine_connector.client is None
+                or is_fallback_disable
+                or not is_backward_compatible(dto.manifest_str)
+            ):
+                raise e
+
             logger.warning(
-                "Failed to execute v3 query, fallback to v2: {}\n" + MIGRATION_MESSAGE,
-                str(e),
+                "Failed to execute v3 query, try to fallback to v2: {}\n", str(e)
             )
-            return await v2.connector.query(
-                data_source,
-                dto,
-                dry_run,
-                cache_enable,
-                override_cache,
-                limit,
-                java_engine_connector,
-                query_cache_manager,
-                headers,
-            )
+            headers = append_fallback_context(headers, span)
+            try:
+                return await v2.connector.query(
+                    data_source=data_source,
+                    dto=dto,
+                    dry_run=dry_run,
+                    limit=limit,
+                    java_engine_connector=java_engine_connector,
+                    headers=headers,
+                    is_fallback=True,
+                    cache_enable=cache_enable,
+                    override_cache=override_cache,
+                    query_cache_manager=query_cache_manager,
+                )
+            except Exception as ve:
+                # ignore v2 error messages in fallback, return v3 error instead.
+                logger.debug(
+                    "v2 fallback failed for v3 query; suppressing v2 error: %s", ve
+                )
+                raise e from None
 
 
 @router.post("/dry-plan", description="get the planned WrenSQL")
 async def dry_plan(
+    headers: Annotated[Headers, Depends(get_wren_headers)],
     dto: DryPlanDTO,
-    headers: Annotated[Headers, Depends(get_wren_headers)] = None,
     java_engine_connector: JavaEngineConnector = Depends(get_java_engine_connector),
 ) -> str:
     with tracer.start_as_current_span(
         name="dry_plan", kind=trace.SpanKind.SERVER, context=build_context(headers)
-    ):
+    ) as span:
+        set_attribute(headers, span)
         try:
-            return await Rewriter(dto.manifest_str, experiment=True).rewrite(dto.sql)
+            return await Rewriter(
+                dto.manifest_str, experiment=True, properties=dict(headers)
+            ).rewrite(dto.sql)
         except Exception as e:
-            logger.warning(
-                "Failed to execute v3 dry-plan, fallback to v2: {}\n"
-                + MIGRATION_MESSAGE,
-                str(e),
+            is_fallback_disable = bool(
+                headers.get(X_WREN_FALLBACK_DISABLE)
+                and safe_strtobool(headers.get(X_WREN_FALLBACK_DISABLE, "false"))
             )
-            return await v2.connector.dry_plan(dto, java_engine_connector, headers)
+            # because the v2 API doesn't support row-level access control,
+            # we don't fallback to v2 if the header include row-level access control properties.
+            if (
+                java_engine_connector.client is None
+                or is_fallback_disable
+                or not is_backward_compatible(dto.manifest_str)
+            ):
+                raise e
+
+            logger.warning(
+                "Failed to execute v3 dry-plan, try to fallback to v2: {}", str(e)
+            )
+            headers = append_fallback_context(headers, span)
+            try:
+                return await v2.connector.dry_plan(
+                    dto=dto,
+                    java_engine_connector=java_engine_connector,
+                    headers=headers,
+                    is_fallback=True,
+                )
+            except Exception as ve:
+                # ignore v2 error messages in fallback, return v3 error instead.
+                logger.debug(
+                    "v2 fallback failed for v3 dry-plan; suppressing v2 error: %s", ve
+                )
+                raise e from None
 
 
 @router.post(
@@ -178,60 +284,130 @@ async def dry_plan(
     description="get the dialect SQL for the specified data source",
 )
 async def dry_plan_for_data_source(
+    headers: Annotated[Headers, Depends(get_wren_headers)],
     data_source: DataSource,
     dto: DryPlanDTO,
-    headers: Annotated[Headers, Depends(get_wren_headers)] = None,
     java_engine_connector: JavaEngineConnector = Depends(get_java_engine_connector),
 ) -> str:
     span_name = f"v3_dry_plan_{data_source}"
     with tracer.start_as_current_span(
         name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
-    ):
+    ) as span:
+        set_attribute(headers, span)
         try:
             return await Rewriter(
-                dto.manifest_str, data_source=data_source, experiment=True
+                dto.manifest_str,
+                data_source=data_source,
+                experiment=True,
+                properties=dict(headers),
             ).rewrite(dto.sql)
         except Exception as e:
+            is_fallback_disable = bool(
+                headers.get(X_WREN_FALLBACK_DISABLE)
+                and safe_strtobool(headers.get(X_WREN_FALLBACK_DISABLE, "false"))
+            )
+            # because the v2 API doesn't support row-level access control,
+            # we don't fallback to v2 if the header include row-level access control properties.
+            if (
+                java_engine_connector.client is None
+                or is_fallback_disable
+                or not is_backward_compatible(dto.manifest_str)
+            ):
+                raise e
+
             logger.warning(
-                "Failed to execute v3 dry-plan, fallback to v2: {}\n"
-                + MIGRATION_MESSAGE,
+                "Failed to execute v3 dry-plan, try to fallback to v2: {}",
                 str(e),
             )
-            return await v2.connector.dry_plan_for_data_source(
-                data_source, dto, java_engine_connector, headers
-            )
+            headers = append_fallback_context(headers, span)
+            try:
+                return await v2.connector.dry_plan_for_data_source(
+                    data_source=data_source,
+                    dto=dto,
+                    java_engine_connector=java_engine_connector,
+                    headers=headers,
+                    is_fallback=True,
+                )
+            except Exception as ve:
+                # ignore v2 error messages in fallback, return v3 error instead.
+                logger.debug(
+                    "v2 fallback failed for v3 dry-plan; suppressing v2 error: %s", ve
+                )
+                raise e from None
 
 
 @router.post(
     "/{data_source}/validate/{rule_name}", description="validate the specified rule"
 )
 async def validate(
+    headers: Annotated[Headers, Depends(get_wren_headers)],
     data_source: DataSource,
     rule_name: str,
     dto: ValidateDTO,
-    headers: Annotated[Headers, Depends(get_wren_headers)] = None,
     java_engine_connector: JavaEngineConnector = Depends(get_java_engine_connector),
 ) -> Response:
     span_name = f"v3_validate_{data_source}"
     with tracer.start_as_current_span(
         name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
-    ):
+    ) as span:
+        set_attribute(headers, span)
+        connection_info = data_source.get_connection_info(
+            dto.connection_info, dict(headers)
+        )
         try:
             validator = Validator(
-                Connector(data_source, dto.connection_info),
-                Rewriter(dto.manifest_str, data_source=data_source, experiment=True),
+                Connector(data_source, connection_info),
+                Rewriter(
+                    dto.manifest_str,
+                    data_source=data_source,
+                    experiment=True,
+                    properties=dict(headers),
+                ),
             )
-            await validator.validate(rule_name, dto.parameters, dto.manifest_str)
+            await execute_validate_with_timeout(
+                validator,
+                rule_name,
+                dto.parameters,
+                dto.manifest_str,
+            )
             return Response(status_code=204)
+        except DatabaseTimeoutError:
+            # won't fallback to v2 if timeout
+            raise
         except Exception as e:
+            is_fallback_disable = bool(
+                headers.get(X_WREN_FALLBACK_DISABLE)
+                and safe_strtobool(headers.get(X_WREN_FALLBACK_DISABLE, "false"))
+            )
+            # because the v2 API doesn't support row-level access control,
+            # we don't fallback to v2 if the header include row-level access control properties.
+            if (
+                java_engine_connector.client is None
+                or is_fallback_disable
+                or not is_backward_compatible(dto.manifest_str)
+            ):
+                raise e
+
             logger.warning(
-                "Failed to execute v3 validate, fallback to v2: {}\n"
-                + MIGRATION_MESSAGE,
+                "Failed to execute v3 validate, try to fallback to v2: {}",
                 str(e),
             )
-            return await v2.connector.validate(
-                data_source, rule_name, dto, java_engine_connector, headers
-            )
+            headers = append_fallback_context(headers, span)
+            try:
+                return await v2.connector.validate(
+                    data_source=data_source,
+                    rule_name=rule_name,
+                    dto=dto,
+                    java_engine_connector=java_engine_connector,
+                    headers=headers,
+                    is_fallback=True,
+                )
+            except Exception as ve:
+                # ignore v2 error messages in fallback, return v3 error instead.
+                logger.debug(
+                    "v2 fallback failed for v3 validate; suppressing v2 error: %s", ve
+                )
+                raise e from None
 
 
 @router.get(
@@ -247,8 +423,22 @@ def functions(
         name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
     ):
         file_path = get_config().get_remote_function_list_path(data_source)
+        white_function_list_path = get_config().get_remote_white_function_list_path(
+            data_source
+        )
+        is_white_list = get_config().get_data_source_is_white_list(data_source)
         session_context = get_session_context(None, file_path)
-        func_list = [f.to_dict() for f in session_context.get_available_functions()]
+        if is_white_list:
+            func_list = (
+                duckdb.read_csv(
+                    white_function_list_path,
+                    header=True,
+                )
+                .to_df()
+                .to_dict("records")
+            )
+        else:
+            func_list = [f.to_dict() for f in session_context.get_available_functions()]
         return ORJSONResponse(func_list)
 
 
@@ -265,23 +455,58 @@ async def model_substitute(
     span_name = f"v3_model-substitute_{data_source}"
     with tracer.start_as_current_span(
         name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
-    ):
+    ) as span:
+        set_attribute(headers, span)
+        connection_info = data_source.get_connection_info(
+            dto.connection_info, dict(headers)
+        )
         try:
             sql = ModelSubstitute(data_source, dto.manifest_str, headers).substitute(
                 dto.sql
             )
-            Connector(data_source, dto.connection_info).dry_run(
-                await Rewriter(
-                    dto.manifest_str,
-                    data_source=data_source,
-                    experiment=True,
-                ).rewrite(sql)
+            connector = Connector(data_source, connection_info)
+            rewritten_sql = await Rewriter(
+                dto.manifest_str,
+                data_source=data_source,
+                java_engine_connector=java_engine_connector,
+            ).rewrite(sql)
+            await execute_dry_run_with_timeout(
+                connector,
+                rewritten_sql,
             )
             return sql
+        except DatabaseTimeoutError:
+            # won't fallback to v2 if timeout
+            raise
         except Exception as e:
+            is_fallback_disable = bool(
+                headers.get(X_WREN_FALLBACK_DISABLE)
+                and safe_strtobool(headers.get(X_WREN_FALLBACK_DISABLE, "false"))
+            )
+            if (
+                java_engine_connector.client is None
+                or is_fallback_disable
+                or not is_backward_compatible(dto.manifest_str)
+            ):
+                raise e
+
             logger.warning(
-                "Failed to execute v3 model-substitute, fallback to v2: {}", str(e)
+                "Failed to execute v3 model-substitute, try to fallback to v2: {}",
+                str(e),
             )
-            return await v2.connector.model_substitute(
-                data_source, dto, headers, java_engine_connector
-            )
+            headers = append_fallback_context(headers, span)
+            try:
+                return await v2.connector.model_substitute(
+                    data_source=data_source,
+                    dto=dto,
+                    headers=headers,
+                    java_engine_connector=java_engine_connector,
+                    is_fallback=True,
+                )
+            except Exception as ve:
+                # ignore v2 error messages in fallback, return v3 error instead.
+                logger.debug(
+                    "v2 fallback failed for v3 model-substitute; suppressing v2 error: %s",
+                    ve,
+                )
+                raise e from None

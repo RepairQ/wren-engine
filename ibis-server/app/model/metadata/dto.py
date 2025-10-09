@@ -7,7 +7,7 @@ from app.model import ConnectionInfo
 
 
 class MetadataDTO(BaseModel):
-    connection_info: ConnectionInfo = Field(alias="connectionInfo")
+    connection_info: dict[str, Any] | ConnectionInfo = Field(alias="connectionInfo")
 
 
 class RustWrenEngineColumnType(Enum):
@@ -50,6 +50,11 @@ class RustWrenEngineColumnType(Enum):
     INT64 = "INT64"
     TIME = "TIME"
     NULL = "NULL"
+
+    # Extension types
+    ## PostGIS
+    GEOMETRY = "GEOMETRY"
+    GEOGRAPHY = "GEOGRAPHY"
 
 
 class Column(BaseModel):

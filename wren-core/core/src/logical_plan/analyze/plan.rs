@@ -7,21 +7,25 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Field;
 use datafusion::common::{
-    internal_err, plan_err, Column, DFSchema, DFSchemaRef, TableReference,
+    internal_datafusion_err, internal_err, plan_err, Column as DFColumn, DFSchema,
+    DFSchemaRef, TableReference,
 };
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::expr::WildcardOptions;
 use datafusion::logical_expr::utils::find_aggregate_exprs;
 use datafusion::logical_expr::{
     col, Expr, Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
-use log::debug;
+use log::{debug, warn};
 use petgraph::Graph;
 
+use crate::logical_plan::analyze::access_control::validate_clac_rule;
 use crate::logical_plan::analyze::RelationChain;
 use crate::logical_plan::analyze::RelationChain::Start;
+use crate::logical_plan::error::WrenError;
 use crate::logical_plan::utils::{from_qualified_name, try_map_data_type};
 use crate::mdl;
+use crate::mdl::context::SessionPropertiesRef;
 use crate::mdl::lineage::DatasetLink;
 use crate::mdl::manifest::{JoinType, Model};
 use crate::mdl::utils::{
@@ -30,6 +34,8 @@ use crate::mdl::utils::{
 };
 use crate::mdl::Dataset;
 use crate::mdl::{AnalyzedWrenMDL, ColumnReference, SessionStateRef};
+
+use super::access_control::{collect_condition, validate_rule};
 
 #[derive(Debug)]
 pub(crate) enum WrenPlan {
@@ -55,7 +61,7 @@ impl WrenPlan {
 /// It only generates the top plan for the model, and the relation chain will generate the source plan.
 #[derive(PartialEq, Eq, Hash, Debug, Clone)]
 pub(crate) struct ModelPlanNode {
-    pub(crate) plan_name: String,
+    pub(crate) model: Arc<Model>,
     pub(crate) required_exprs: Vec<Expr>,
     pub(crate) relation_chain: Box<RelationChain>,
     schema_ref: DFSchemaRef,
@@ -69,8 +75,9 @@ impl ModelPlanNode {
         original_table_scan: Option<LogicalPlan>,
         analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
         session_state: SessionStateRef,
+        properties: SessionPropertiesRef,
     ) -> Result<Self> {
-        ModelPlanNodeBuilder::new(analyzed_wren_mdl, session_state).build(
+        ModelPlanNodeBuilder::new(analyzed_wren_mdl, session_state, properties).build(
             model,
             required_fields,
             original_table_scan,
@@ -78,7 +85,7 @@ impl ModelPlanNode {
     }
 
     pub fn plan_name(&self) -> &str {
-        &self.plan_name
+        self.model.name()
     }
 }
 
@@ -98,12 +105,14 @@ struct ModelPlanNodeBuilder {
     fields: VecDeque<(Option<TableReference>, Arc<Field>)>,
     analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
     session_state: SessionStateRef,
+    properties: SessionPropertiesRef,
 }
 
 impl ModelPlanNodeBuilder {
     fn new(
         analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
         session_state: SessionStateRef,
+        properties: SessionPropertiesRef,
     ) -> Self {
         Self {
             required_exprs_buffer: BTreeSet::new(),
@@ -113,6 +122,7 @@ impl ModelPlanNodeBuilder {
             fields: VecDeque::new(),
             analyzed_wren_mdl,
             session_state,
+            properties,
         }
     }
 
@@ -128,13 +138,54 @@ impl ModelPlanNodeBuilder {
             model.name(),
         );
 
+        let required_fields =
+            self.add_required_columns_from_session_properties(&model, required_fields)?;
+
+        // `required_fields` could contain the hidden columns, so we need to get from all physical columns.
         let required_columns =
-            model.get_physical_columns().into_iter().filter(|column| {
-                required_fields
-                    .iter()
-                    .any(|expr| is_required_column(expr, column.name()))
-            });
+            model
+                .get_physical_columns(false)
+                .into_iter()
+                .filter(|column| {
+                    required_fields
+                        .iter()
+                        .any(|expr| is_required_column(expr, column.name()))
+                });
         for column in required_columns {
+            // Actually, it's only be checked in PermissionAnalyze mode.
+            // In Unparse or LocalRuntime mode, an invalid column won't be registered in the table provider.
+            // A column accessing will be failed by the column not found error.
+            let (is_valid, rule_name) = validate_clac_rule(
+                model.name(),
+                &column,
+                &self.properties,
+                Some(Arc::clone(&self.analyzed_wren_mdl)),
+            )?;
+            if !is_valid {
+                let message = if let Some(rule_name) = rule_name {
+                    format!(
+                        r#"Access denied to column "{}"."{}": violates access control rule "{}""#,
+                        model.name(),
+                        column.name(),
+                        rule_name
+                    )
+                } else {
+                    warn!(
+                        "No rule name found for column access, {}.{}",
+                        model.name(),
+                        column.name()
+                    );
+                    format!(
+                        r#"Access denied to column "{}"."{}"#,
+                        model.name(),
+                        column.name(),
+                    )
+                };
+                return Err(DataFusionError::External(Box::new(
+                    WrenError::PermissionDenied(message),
+                )));
+            }
+
             if column.is_calculated {
                 let expr = if column.expression.is_some() {
                     let column_rf = self
@@ -185,24 +236,58 @@ impl ModelPlanNodeBuilder {
                         expr,
                     )?;
                     self.required_calculation.push(calculation);
+                    // insert the primary key to the required fields for join with the calculation
+
+                    let Some(pk_column) = model
+                        .primary_key()
+                        .and_then(|pk| model.get_visible_column(pk))
+                    else {
+                        return plan_err!(
+                            "Primary key not found for model {}. To use `TO_MANY` relationship, the primary key is required for the base model.",
+                            model.name()
+                        );
+                    };
+                    self.model_required_fields
+                        .entry(TableReference::full(
+                            self.analyzed_wren_mdl.wren_mdl().catalog(),
+                            self.analyzed_wren_mdl.wren_mdl().schema(),
+                            model.name(),
+                        ))
+                        .or_default()
+                        .insert(OrdExpr::new(Expr::Column(
+                            DFColumn::from_qualified_name(format!(
+                                "{}.{}",
+                                quoted(model.name()),
+                                quoted(pk_column.name()),
+                            )),
+                        )));
                 } else {
                     merge_graph(&mut self.directed_graph, column_graph)?;
                     if self.is_contain_calculation_source(&qualified_column) {
-                        collect_partial_model_plan(
+                        collect_partial_model_plan_for_calculation(
                             Arc::clone(&self.analyzed_wren_mdl),
                             Arc::clone(&self.session_state),
                             &qualified_column,
                             &mut self.model_required_fields,
                         )?;
                     }
-                    self.required_exprs_buffer
-                        .insert(OrdExpr::new(expr.clone()));
-                    let _ = collect_model_required_fields(
-                        &qualified_column,
+                    // Collect the column for building the partial model for the related model.
+                    collect_partial_model_required_fields(
                         Arc::clone(&self.analyzed_wren_mdl),
                         Arc::clone(&self.session_state),
+                        &qualified_column,
                         &mut self.model_required_fields,
-                    );
+                    )?;
+                    self.required_exprs_buffer
+                        .insert(OrdExpr::new(expr.clone()));
+                    // Collect the column for building the source model
+                    collect_model_required_fields(
+                        Arc::clone(&self.analyzed_wren_mdl),
+                        Arc::clone(&self.session_state),
+                        Arc::clone(&self.properties),
+                        &qualified_column,
+                        &mut self.model_required_fields,
+                    )?;
                 }
             } else {
                 let expr_plan = get_remote_column_exp(
@@ -210,12 +295,13 @@ impl ModelPlanNodeBuilder {
                     Arc::clone(&model),
                     Arc::clone(&self.analyzed_wren_mdl),
                     Arc::clone(&self.session_state),
+                    Arc::clone(&self.properties),
                 )?;
                 self.model_required_fields
                     .entry(model_ref.clone())
                     .or_default()
                     .insert(OrdExpr::new(expr_plan.clone()));
-                let expr_plan = Expr::Column(Column::from_qualified_name(format!(
+                let expr_plan = Expr::Column(DFColumn::from_qualified_name(format!(
                     "{}.{}",
                     quoted(model_ref.table()),
                     quoted(column.name()),
@@ -255,36 +341,11 @@ impl ModelPlanNodeBuilder {
             return internal_err!("Dataset not found");
         };
 
-        // insert the primary key to the required fields for join with the calculation
-        let keys = self
-            .model_required_fields
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        for model in keys {
-            let Some(pk_column) = self
-                .analyzed_wren_mdl
-                .wren_mdl()
-                .get_model(model.table())
-                .and_then(|m| m.primary_key().and_then(|pk| m.get_column(pk)))
-            else {
-                debug!("Primary key not found for model {}", model);
-                continue;
-            };
-            self.model_required_fields
-                .entry(model.clone())
-                .or_default()
-                .insert(OrdExpr::new(Expr::Column(Column::from_qualified_name(
-                    format!("{}.{}", quoted(model.table()), quoted(pk_column.name()),),
-                ))));
-        }
-
         let mut source_required_fields: Vec<Expr> = self
             .model_required_fields
             .get(&model_ref)
             .map(|c| c.iter().cloned().map(|c| c.expr).collect())
             .unwrap_or_default();
-
         let mut calculate_iter = self.required_calculation.iter();
         let source_chain =
             if !source_required_fields.is_empty() || required_fields.is_empty() {
@@ -304,6 +365,7 @@ impl ModelPlanNodeBuilder {
                     source_required_fields,
                     Arc::clone(&self.analyzed_wren_mdl),
                     Arc::clone(&self.session_state),
+                    Arc::clone(&self.properties),
                 )?
             } else {
                 let Some(first_calculation) = calculate_iter.next() else {
@@ -322,6 +384,7 @@ impl ModelPlanNodeBuilder {
             &self.model_required_fields.clone(),
             Arc::clone(&self.analyzed_wren_mdl),
             Arc::clone(&self.session_state),
+            Arc::clone(&self.properties),
         )?;
 
         for calculation_plan in calculate_iter {
@@ -349,7 +412,7 @@ impl ModelPlanNodeBuilder {
         }
 
         Ok(ModelPlanNode {
-            plan_name: model.name().to_string(),
+            model,
             required_exprs: self
                 .required_exprs_buffer
                 .iter()
@@ -362,11 +425,30 @@ impl ModelPlanNodeBuilder {
         })
     }
 
+    fn add_required_columns_from_session_properties(
+        &self,
+        model: &Model,
+        required_fields: Vec<Expr>,
+    ) -> Result<Vec<Expr>> {
+        let mut required_fields = required_fields;
+        model
+            .row_level_access_controls()
+            .iter()
+            .try_for_each(|rule| {
+                if validate_rule(&rule.name, &rule.required_properties, &self.properties)?
+                {
+                    required_fields.extend(collect_condition(model, &rule.condition)?.0);
+                }
+                Ok::<_, DataFusionError>(())
+            })?;
+        Ok(required_fields)
+    }
+
     fn is_to_many_calculation(&self, expr: Expr) -> bool {
         !find_aggregate_exprs(&[expr]).is_empty()
     }
 
-    fn is_contain_calculation_source(&self, qualified_column: &Column) -> bool {
+    fn is_contain_calculation_source(&self, qualified_column: &DFColumn) -> bool {
         self.analyzed_wren_mdl
             .lineage()
             .required_fields_map
@@ -387,7 +469,7 @@ impl ModelPlanNodeBuilder {
         &mut self,
         model_ref: TableReference,
         column: Arc<mdl::manifest::Column>,
-        qualified_column: &Column,
+        qualified_column: &DFColumn,
         col_expr: Expr,
     ) -> Result<WrenPlan> {
         let Some(column_graph) = self
@@ -409,7 +491,7 @@ impl ModelPlanNodeBuilder {
         let mut partial_model_required_fields = HashMap::new();
 
         if self.is_contain_calculation_source(qualified_column) {
-            collect_partial_model_plan(
+            collect_partial_model_plan_for_calculation(
                 Arc::clone(&self.analyzed_wren_mdl),
                 Arc::clone(&self.session_state),
                 qualified_column,
@@ -417,10 +499,10 @@ impl ModelPlanNodeBuilder {
             )?;
         }
 
-        collect_model_required_fields(
-            qualified_column,
+        collect_partial_model_required_fields(
             Arc::clone(&self.analyzed_wren_mdl),
             Arc::clone(&self.session_state),
+            qualified_column,
             &mut partial_model_required_fields,
         )?;
 
@@ -438,6 +520,7 @@ impl ModelPlanNodeBuilder {
             source_required_fields,
             Arc::clone(&self.analyzed_wren_mdl),
             Arc::clone(&self.session_state),
+            Arc::clone(&self.properties),
         )?;
 
         let partial_chain = RelationChain::with_chain(
@@ -448,6 +531,7 @@ impl ModelPlanNodeBuilder {
             &partial_model_required_fields,
             Arc::clone(&self.analyzed_wren_mdl),
             Arc::clone(&self.session_state),
+            Arc::clone(&self.properties),
         )?;
         let Some(column_rf) = self
             .analyzed_wren_mdl
@@ -475,10 +559,12 @@ fn is_required_column(expr: &Expr, name: &str) -> bool {
     }
 }
 
-fn collect_partial_model_plan(
+/// Collect the fields for the calculation plan.
+/// It collects the only calculated fields for the calculation plan.
+fn collect_partial_model_plan_for_calculation(
     analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
     session_state_ref: SessionStateRef,
-    qualified_column: &Column,
+    qualified_column: &DFColumn,
     required_fields: &mut HashMap<TableReference, BTreeSet<OrdExpr>>,
 ) -> Result<()> {
     let Some(set) = analyzed_wren_mdl
@@ -517,11 +603,13 @@ fn collect_partial_model_plan(
     Ok(())
 }
 
-fn collect_model_required_fields(
-    qualified_column: &Column,
+/// Collect the required fields for the partial model used by another model throguh the relationship.
+/// It collects the non-calculated fields for the he partial model used by another model.
+fn collect_partial_model_required_fields(
     analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
     session_state_ref: SessionStateRef,
-    model_required_fields: &mut HashMap<TableReference, BTreeSet<OrdExpr>>,
+    qualified_column: &DFColumn,
+    required_fields: &mut HashMap<TableReference, BTreeSet<OrdExpr>>,
 ) -> Result<()> {
     let Some(set) = analyzed_wren_mdl
         .lineage()
@@ -530,7 +618,7 @@ fn collect_model_required_fields(
     else {
         return plan_err!("Required fields not found for {}", qualified_column);
     };
-    debug!("Required fields: {:?}", set);
+
     for c in set {
         let Some(relation_ref) = &c.relation else {
             return plan_err!("Source dataset not found for {}", c);
@@ -539,6 +627,50 @@ fn collect_model_required_fields(
             analyzed_wren_mdl.wren_mdl().get_column_reference(c)
         else {
             return plan_err!("Column reference not found for {}", c);
+        };
+        if !column.is_calculated {
+            let expr = create_wren_expr_for_model(
+                &c.name,
+                dataset.try_as_model().ok_or_else(|| {
+                    internal_datafusion_err!("Only support model as source dataset")
+                })?,
+                Arc::clone(&session_state_ref),
+            )?;
+            required_fields
+                .entry(relation_ref.clone())
+                .or_default()
+                .insert(OrdExpr::with_column(expr, Arc::clone(&column)));
+        }
+    }
+    Ok(())
+}
+
+/// Collect the required field for the model plan.
+/// It collect the calculated fields for building the calculation plan.
+/// It collects the non-calculated source column for building the model source plan.
+fn collect_model_required_fields(
+    analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
+    session_state_ref: SessionStateRef,
+    session_properties: SessionPropertiesRef,
+    qualified_column: &DFColumn,
+    required_fields: &mut HashMap<TableReference, BTreeSet<OrdExpr>>,
+) -> Result<()> {
+    let Some(set) = analyzed_wren_mdl
+        .lineage()
+        .required_fields_map
+        .get(qualified_column)
+    else {
+        return plan_err!("Required fields not found for {}", qualified_column);
+    };
+    debug!("Required fields: {set:?}");
+    for c in set {
+        let Some(relation_ref) = &c.relation else {
+            return plan_err!("Source dataset not found for {c}");
+        };
+        let Some(ColumnReference { dataset, column }) =
+            analyzed_wren_mdl.wren_mdl().get_column_reference(c)
+        else {
+            return plan_err!("Column reference not found for {c}");
         };
         if let Dataset::Model(m) = dataset {
             if column.is_calculated {
@@ -549,10 +681,7 @@ fn collect_model_required_fields(
                         Arc::clone(&session_state_ref),
                     ) else {
                         // skip the semantic expression (e.g. calculated field or relationship column)
-                        debug!(
-                            "Error creating expression for calculated field: {}",
-                            expression
-                        );
+                        debug!("Error creating expression for calculated field: {expression}");
                         continue;
                     };
                     expr
@@ -561,7 +690,7 @@ fn collect_model_required_fields(
                 }
                 .alias(column.name.clone());
                 debug!("Required Calculated field: {}", &expr_plan);
-                model_required_fields
+                required_fields
                     .entry(relation_ref.clone())
                     .or_default()
                     .insert(OrdExpr::with_column(expr_plan, column));
@@ -571,9 +700,10 @@ fn collect_model_required_fields(
                     Arc::clone(&m),
                     Arc::clone(&analyzed_wren_mdl),
                     Arc::clone(&session_state_ref),
+                    Arc::clone(&session_properties),
                 )?;
                 debug!("Required field: {}", &expr_plan);
-                model_required_fields
+                required_fields
                     .entry(relation_ref.clone())
                     .or_default()
                     .insert(OrdExpr::with_column(expr_plan, column));
@@ -590,7 +720,41 @@ fn get_remote_column_exp(
     model: Arc<Model>,
     analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
     session_state_ref: SessionStateRef,
+    session_properties: SessionPropertiesRef,
 ) -> Result<Expr> {
+    // Actually, it's only be checked in PermissionAnalyze mode.
+    // In Unparse or LocalRuntime mode, an invalid column won't be registered in the table provider.
+    // A column accessing will be failed by the column not found error.
+    let (is_valid, rule_name) = validate_clac_rule(
+        model.name(),
+        column,
+        &session_properties,
+        Some(Arc::clone(&analyzed_wren_mdl)),
+    )?;
+    if !is_valid {
+        let message = if let Some(rule_name) = rule_name {
+            format!(
+                r#"Access denied to column "{}"."{}": violates access control rule "{}""#,
+                model.name(),
+                column.name(),
+                rule_name
+            )
+        } else {
+            warn!(
+                "No rule name found for column access, {}.{}",
+                model.name(),
+                column.name()
+            );
+            format!(
+                r#"Access denied to column "{}"."{}"#,
+                model.name(),
+                column.name(),
+            )
+        };
+        return Err(DataFusionError::External(Box::new(
+            WrenError::PermissionDenied(message),
+        )));
+    }
     let expr = if let Some(expression) = &column.expression {
         create_remote_expr_for_model(
             expression,
@@ -701,7 +865,8 @@ impl UserDefinedLogicalNodeCore for ModelPlanNode {
         write!(
             f,
             "Model: name={}, schema={}",
-            self.plan_name, self.schema_ref
+            self.model.name(),
+            self.schema_ref
         )
     }
 
@@ -711,7 +876,7 @@ impl UserDefinedLogicalNodeCore for ModelPlanNode {
         _: Vec<LogicalPlan>,
     ) -> datafusion::common::Result<Self> {
         Ok(ModelPlanNode {
-            plan_name: self.plan_name.clone(),
+            model: self.model.clone(),
             required_exprs: self.required_exprs.clone(),
             relation_chain: self.relation_chain.clone(),
             schema_ref: self.schema_ref.clone(),
@@ -737,6 +902,7 @@ impl ModelSourceNode {
         required_exprs: Vec<Expr>,
         analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
         session_state_ref: SessionStateRef,
+        session_properties: SessionPropertiesRef,
         original_table_scan: Option<LogicalPlan>,
     ) -> Result<Self> {
         let mut required_exprs_buffer = BTreeSet::new();
@@ -755,7 +921,7 @@ impl ModelSourceNode {
                 } else {
                     Arc::clone(&model)
                 };
-                for column in model.get_physical_columns().into_iter() {
+                for column in model.get_physical_columns(false).into_iter() {
                     // skip the calculated field
                     if column.is_calculated {
                         continue;
@@ -773,19 +939,17 @@ impl ModelSourceNode {
                         Arc::clone(&model),
                         Arc::clone(&analyzed_wren_mdl),
                         Arc::clone(&session_state_ref),
+                        Arc::clone(&session_properties),
                     )?));
                 }
             } else {
-                let Some(column) =
-                    model
-                        .get_physical_columns()
-                        .into_iter()
-                        .find(|column| match expr {
-                            Expr::Column(c) => c.name.as_str() == column.name(),
-                            Expr::Alias(alias) => alias.name.as_str() == column.name(),
-                            _ => false,
-                        })
-                else {
+                let Some(column) = model.get_physical_columns(false).into_iter().find(
+                    |column| match expr {
+                        Expr::Column(c) => c.name.as_str() == column.name(),
+                        Expr::Alias(alias) => alias.name.as_str() == column.name(),
+                        _ => false,
+                    },
+                ) else {
                     return plan_err!("Field not found {}", expr);
                 };
                 if column.is_calculated {
@@ -796,6 +960,7 @@ impl ModelSourceNode {
                         Arc::clone(&model),
                         Arc::clone(&analyzed_wren_mdl),
                         Arc::clone(&session_state_ref),
+                        Arc::clone(&session_properties),
                     )?;
                     required_exprs_buffer.insert(OrdExpr::new(expr_plan.clone()));
                 }
@@ -889,7 +1054,9 @@ impl CalculationPlanNode {
         let Some(model) = calculation.dataset.try_as_model() else {
             return plan_err!("Only support model as source dataset");
         };
-        let Some(pk_column) = model.primary_key().and_then(|pk| model.get_column(pk))
+        let Some(pk_column) = model
+            .primary_key()
+            .and_then(|pk| model.get_visible_column(pk))
         else {
             return plan_err!("Primary key not found");
         };
@@ -1019,7 +1186,7 @@ impl UserDefinedLogicalNodeCore for PartialModelPlanNode {
     }
 
     fn fmt_for_explain(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "PartialModel: name={}", self.model_node.plan_name)
+        write!(f, "PartialModel: name={}", self.model_node.model.name())
     }
 
     fn with_exprs_and_inputs(

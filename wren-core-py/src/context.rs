@@ -19,7 +19,10 @@ use crate::errors::CoreError;
 use crate::manifest::to_manifest;
 use crate::remote_functions::PyRemoteFunction;
 use log::debug;
-use pyo3::{pyclass, pymethods, PyErr, PyResult};
+use pyo3::types::{PyAnyMethods, PyFrozenSet, PyFrozenSetMethods, PyTuple};
+use pyo3::Python;
+use pyo3::{pyclass, pymethods, Py, PyAny, PyErr, PyResult};
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::ControlFlow;
 use std::str::FromStr;
@@ -27,7 +30,7 @@ use std::sync::Arc;
 use std::vec;
 use tokio::runtime::Runtime;
 use wren_core::array::AsArray;
-use wren_core::ast::{visit_statements_mut, Expr, Statement, Value};
+use wren_core::ast::{visit_statements_mut, Expr, Statement, Value, ValueWithSpan};
 use wren_core::dialect::GenericDialect;
 use wren_core::mdl::context::create_ctx_with_mdl;
 use wren_core::mdl::function::{
@@ -43,7 +46,9 @@ use wren_core::{
 #[derive(Clone)]
 pub struct PySessionContext {
     ctx: wren_core::SessionContext,
+    exec_ctx: wren_core::SessionContext,
     mdl: Arc<AnalyzedWrenMDL>,
+    properties: Arc<HashMap<String, Option<String>>>,
     runtime: Arc<Runtime>,
 }
 
@@ -57,7 +62,9 @@ impl Default for PySessionContext {
     fn default() -> Self {
         Self {
             ctx: wren_core::SessionContext::new(),
+            exec_ctx: wren_core::SessionContext::new(),
             mdl: Arc::new(AnalyzedWrenMDL::default()),
+            properties: Arc::new(HashMap::new()),
             runtime: Arc::new(Runtime::new().unwrap()),
         }
     }
@@ -70,10 +77,11 @@ impl PySessionContext {
     /// if `mdl_base64` is provided, the session context will be created with the given MDL. Otherwise, an empty MDL will be created.
     /// if `remote_functions_path` is provided, the session context will be created with the remote functions defined in the CSV file.
     #[new]
-    #[pyo3(signature = (mdl_base64=None, remote_functions_path=None))]
+    #[pyo3(signature = (mdl_base64=None, remote_functions_path=None, properties=None))]
     pub fn new(
         mdl_base64: Option<&str>,
         remote_functions_path: Option<&str>,
+        properties: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let remote_functions = Self::read_remote_function_list(remote_functions_path)
             .map_err(CoreError::from)?;
@@ -109,38 +117,106 @@ impl PySessionContext {
 
         let Some(mdl_base64) = mdl_base64 else {
             return Ok(Self {
-                ctx,
+                ctx: ctx.clone(),
+                exec_ctx: ctx,
                 mdl: Arc::new(AnalyzedWrenMDL::default()),
+                properties: Arc::new(HashMap::new()),
                 runtime: Arc::new(runtime),
             });
         };
 
-        let manifest = to_manifest(mdl_base64)?;
+        Python::attach(|py| {
+            let properties_map = if let Some(obj) = properties {
+                let obj = obj.as_ref();
+                if obj.is_none(py) {
+                    HashMap::new()
+                } else {
+                    let frozenset = obj.downcast_bound::<PyFrozenSet>(py)?;
+                    let mut map = HashMap::new();
+                    for item in frozenset.iter() {
+                        match item.as_any().clone().downcast_into::<PyTuple>() {
+                            Ok(tuple) => {
+                                if tuple.len()? != 2 {
+                                    return Err(CoreError::new(
+                                        "Properties must be a tuple of (key, value)",
+                                    )
+                                    .into());
+                                }
+                                let key = tuple.get_item(0)?.to_string();
+                                let value = tuple.get_item(1)?.to_string();
+                                map.insert(key, Some(value));
+                            }
+                            Err(_) => {
+                                return Err(CoreError::new(
+                                    "Properties must be a tuple of (key, value)",
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    map
+                }
+            } else {
+                HashMap::new()
+            };
+            let manifest = to_manifest(mdl_base64)?;
+            let properties_ref = Arc::new(properties_map);
+            match AnalyzedWrenMDL::analyze(
+                manifest,
+                Arc::clone(&properties_ref),
+                mdl::context::Mode::Unparse,
+            ) {
+                Ok(analyzed_mdl) => {
+                    let analyzed_mdl = Arc::new(analyzed_mdl);
+                    let unparser_ctx = runtime
+                        .block_on(create_ctx_with_mdl(
+                            &ctx,
+                            Arc::clone(&analyzed_mdl),
+                            Arc::clone(&properties_ref),
+                            mdl::context::Mode::Unparse,
+                        ))
+                        .map_err(CoreError::from)?;
 
-        let Ok(analyzed_mdl) = AnalyzedWrenMDL::analyze(manifest) else {
-            return Err(CoreError::new("Failed to analyze manifest").into());
-        };
+                    let exec_ctx = runtime
+                        .block_on(create_ctx_with_mdl(
+                            &ctx,
+                            Arc::clone(&analyzed_mdl),
+                            Arc::clone(&properties_ref),
+                            mdl::context::Mode::LocalRuntime,
+                        ))
+                        .map_err(CoreError::from)?;
 
-        let analyzed_mdl = Arc::new(analyzed_mdl);
-
-        let ctx = runtime
-            .block_on(create_ctx_with_mdl(&ctx, Arc::clone(&analyzed_mdl), false))
-            .map_err(CoreError::from)?;
-
-        Ok(Self {
-            ctx,
-            mdl: analyzed_mdl,
-            runtime: Arc::new(runtime),
+                    Ok(Self {
+                        ctx: unparser_ctx,
+                        exec_ctx,
+                        mdl: analyzed_mdl,
+                        runtime: Arc::new(runtime),
+                        properties: properties_ref,
+                    })
+                }
+                Err(e) => Err(CoreError::new(
+                    format!("Failed to analyze MDL: {}", e).as_str(),
+                )
+                .into()),
+            }
         })
     }
 
     /// Transform the given Wren SQL to the equivalent Planned SQL.
-    pub fn transform_sql(&self, sql: &str) -> PyResult<String> {
+    #[pyo3(signature = (sql=None))]
+    pub fn transform_sql(&self, sql: Option<&str>) -> PyResult<String> {
+        env_logger::try_init().ok();
+        let Some(sql) = sql else {
+            return Err(CoreError::new("SQL is required").into());
+        };
         self.runtime
             .block_on(mdl::transform_sql_with_ctx(
                 &self.ctx,
                 Arc::clone(&self.mdl),
+                // the ctx has been initialized when PySessionContext is created
+                // so we can pass the empty array here
                 &[],
+                Arc::clone(&self.properties),
                 sql,
             ))
             .map_err(|e| PyErr::from(CoreError::from(e)))
@@ -150,7 +226,7 @@ impl PySessionContext {
     pub fn get_available_functions(&self) -> PyResult<Vec<PyRemoteFunction>> {
         let registered_functions: Vec<PyRemoteFunction> = self
             .runtime
-            .block_on(Self::get_regietered_functions(&self.ctx))
+            .block_on(Self::get_regietered_functions(&self.exec_ctx))
             .map_err(CoreError::from)?
             .into_iter()
             .map(|f| f.into())
@@ -174,20 +250,26 @@ impl PySessionContext {
         if statements.len() != 1 {
             return Err(CoreError::new("Only one statement is allowed").into());
         }
-        visit_statements_mut(&mut statements, |stmt| {
+        let _ = visit_statements_mut(&mut statements, |stmt| {
             if let Statement::Query(q) = stmt {
                 if let Some(limit) = &q.limit {
-                    if let Expr::Value(Value::Number(n, is)) = limit {
-                        if n.parse::<usize>().unwrap() > pushdown {
-                            q.limit = Some(Expr::Value(Value::Number(
-                                pushdown.to_string(),
-                                *is,
-                            )));
+                    if let Expr::Value(ValueWithSpan {
+                        value: Value::Number(n, is),
+                        ..
+                    }) = limit
+                    {
+                        if let Ok(curr) = n.parse::<usize>() {
+                            if curr > pushdown {
+                                q.limit = Some(Expr::Value(
+                                    Value::Number(pushdown.to_string(), *is).into(),
+                                ));
+                            }
                         }
                     }
                 } else {
-                    q.limit =
-                        Some(Expr::Value(Value::Number(pushdown.to_string(), false)));
+                    q.limit = Some(Expr::Value(
+                        Value::Number(pushdown.to_string(), false).into(),
+                    ));
                 }
             }
             ControlFlow::<()>::Continue(())

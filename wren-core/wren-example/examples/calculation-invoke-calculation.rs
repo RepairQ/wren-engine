@@ -81,21 +81,22 @@ async fn main() -> Result<()> {
         &ctx,
         Arc::clone(&analyzed_mdl),
         &[],
+        HashMap::new().into(),
         "select totalprice from wrenai.public.customers",
     )
     .await
     {
         Ok(sql) => sql,
         Err(e) => {
-            eprintln!("Error transforming SQL: {}", e);
+            eprintln!("Error transforming SQL: {e}");
             return Ok(());
         }
     };
-    println!("Transformed SQL: {}", transformed);
+    println!("Transformed SQL: {transformed}");
     let df = match ctx.sql(&transformed).await {
         Ok(df) => df,
         Err(e) => {
-            eprintln!("Error executing SQL: {}", e);
+            eprintln!("Error executing SQL: {e}");
             return Ok(());
         }
     };
@@ -106,21 +107,22 @@ async fn main() -> Result<()> {
         &ctx,
         Arc::clone(&analyzed_mdl),
         &[],
+        HashMap::new().into(),
         "select customer_state_cf from wrenai.public.order_items",
     )
     .await
     {
         Ok(sql) => sql,
         Err(e) => {
-            eprintln!("Error transforming SQL: {}", e);
+            eprintln!("Error transforming SQL: {e}");
             return Ok(());
         }
     };
-    println!("Transformed SQL: {}", transformed);
+    println!("Transformed SQL: {transformed}");
     let df = match ctx.sql(&transformed).await {
         Ok(df) => df,
         Err(e) => {
-            eprintln!("Error executing SQL: {}", e);
+            eprintln!("Error executing SQL: {e}");
             return Ok(());
         }
     };

@@ -10,11 +10,16 @@ use datafusion::common::plan_err;
 use datafusion::common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
+use datafusion::common::types::{
+    logical_binary, logical_boolean, logical_date, logical_float16, logical_float32,
+    logical_float64, logical_string,
+};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::Result;
 use datafusion::logical_expr::sqlparser::ast::ArrayElemTypeDef;
 use datafusion::logical_expr::sqlparser::dialect::GenericDialect;
 use datafusion::logical_expr::{builder::LogicalTableSource, Expr, TableSource};
+use datafusion::logical_expr::{Coercion, TypeSignatureClass};
 use datafusion::sql::sqlparser::ast;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::TableReference;
@@ -48,7 +53,7 @@ fn create_list_type(array_type: &str) -> Result<DataType> {
             }
         };
         return Ok(DataType::List(Arc::new(Field::new(
-            "element", data_type, false,
+            "item", data_type, true,
         ))));
     }
     unreachable!()
@@ -69,7 +74,7 @@ fn create_struct_type(struct_type: &str) -> Result<DataType> {
                     field
                         .field_name
                         .map(|f| f.to_string())
-                        .unwrap_or_else(|| format!("c{}", counter)),
+                        .unwrap_or_else(|| format!("c{counter}")),
                     data_type,
                     true,
                 );
@@ -96,7 +101,7 @@ fn parse_type(struct_type: &str) -> Result<ast::DataType> {
 /// If the data type is not supported, it will return Utf8
 pub fn try_map_data_type(data_type: &str) -> Result<DataType> {
     Ok(map_data_type(data_type).ok().unwrap_or_else(|| {
-        debug!("can't parse data type {}, return Utf8", data_type);
+        debug!("can't parse data type {data_type}, return Utf8");
         DataType::Utf8
     }))
 }
@@ -178,7 +183,7 @@ pub fn map_data_type(data_type: &str) -> Result<DataType> {
         "bit" => DataType::Boolean, // we don't have a BIT type, so we map it to Boolean
         "timestamp_ns" => DataType::Timestamp(TimeUnit::Nanosecond, None),
         _ => {
-            debug!("try parse by arrow {}", lower_data_type);
+            debug!("try parse by arrow {lower_data_type}");
             // the from_str is case sensitive, so we need to use the original string
             DataType::from_str(data_type)?
         }
@@ -186,9 +191,47 @@ pub fn map_data_type(data_type: &str) -> Result<DataType> {
     Ok(result)
 }
 
-pub fn create_table_source(model: &Model) -> Result<Arc<dyn TableSource>> {
-    let schema = create_schema(model.get_physical_columns())?;
-    Ok(Arc::new(LogicalTableSource::new(schema)))
+pub fn get_coercion_type_signature(data_type: &DataType) -> Result<Coercion> {
+    match data_type {
+        DataType::Boolean => Ok(Coercion::new_exact(TypeSignatureClass::Native(
+            logical_boolean(),
+        ))),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => Ok(Coercion::new_exact(TypeSignatureClass::Integer)),
+        DataType::Timestamp(_, _) => {
+            Ok(Coercion::new_exact(TypeSignatureClass::Timestamp))
+        }
+        DataType::Time32(_) | DataType::Time64(_) => {
+            Ok(Coercion::new_exact(TypeSignatureClass::Time))
+        }
+        DataType::Duration(_) => Ok(Coercion::new_exact(TypeSignatureClass::Duration)),
+        DataType::Interval(_) => Ok(Coercion::new_exact(TypeSignatureClass::Interval)),
+        DataType::Binary | DataType::BinaryView | DataType::LargeBinary => Ok(
+            Coercion::new_exact(TypeSignatureClass::Native(logical_binary())),
+        ),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(
+            Coercion::new_exact(TypeSignatureClass::Native(logical_string())),
+        ),
+        DataType::Date32 | DataType::Date64 => Ok(Coercion::new_exact(
+            TypeSignatureClass::Native(logical_date()),
+        )),
+        DataType::Float16 => Ok(Coercion::new_exact(TypeSignatureClass::Native(
+            logical_float16(),
+        ))),
+        DataType::Float32 => Ok(Coercion::new_exact(TypeSignatureClass::Native(
+            logical_float32(),
+        ))),
+        DataType::Float64 => Ok(Coercion::new_exact(TypeSignatureClass::Native(
+            logical_float64(),
+        ))),
+        _ => plan_err!("Unsupported data type for coercion: {data_type}"),
+    }
 }
 
 pub fn create_schema(columns: Vec<Arc<Column>>) -> Result<SchemaRef> {
@@ -259,7 +302,7 @@ pub fn from_qualified_name_str(
 /// Use to print the graph for debugging purposes
 pub fn print_graph(graph: &Graph<Dataset, DatasetLink>) {
     let dot = Dot::with_config(graph, &[Config::EdgeNoLabel]);
-    println!("graph: {:?}", dot);
+    println!("graph: {dot:?}");
 }
 
 /// Check if the table reference belongs to the mdl
@@ -303,7 +346,7 @@ pub fn expr_to_columns(
             Expr::Unnest(_)
             | Expr::ScalarVariable(_, _)
             | Expr::Alias(_)
-            | Expr::Literal(_)
+            | Expr::Literal(_, _)
             | Expr::BinaryExpr { .. }
             | Expr::Like { .. }
             | Expr::SimilarTo { .. }

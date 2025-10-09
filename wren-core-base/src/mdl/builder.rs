@@ -22,10 +22,14 @@
 use crate::mdl::manifest::{
     Column, DataSource, JoinType, Manifest, Metric, Model, Relationship, TimeGrain, TimeUnit, View,
 };
+#[allow(deprecated)]
 use crate::mdl::{
-    ColumnLevelOperator, ColumnLevelSecurity, NormalizedExpr, RowLevelOperator, RowLevelSecurity,
+    ColumnLevelOperator, ColumnLevelSecurity, NormalizedExpr, RowLevelAccessControl,
+    RowLevelOperator, RowLevelSecurity, SessionProperty,
 };
 use std::sync::Arc;
+
+use super::ColumnLevelAccessControl;
 
 /// A builder for creating a Manifest
 pub struct ManifestBuilder {
@@ -109,6 +113,7 @@ impl ModelBuilder {
                 primary_key: None,
                 cached: false,
                 refresh_time: None,
+                row_level_access_controls: vec![],
             },
         }
     }
@@ -148,15 +153,39 @@ impl ModelBuilder {
         self
     }
 
+    pub fn add_row_level_access_control(
+        mut self,
+        name: &str,
+        required_properties: Vec<SessionProperty>,
+        condition: &str,
+    ) -> Self {
+        let rule = RowLevelAccessControl {
+            name: name.to_string(),
+            required_properties,
+            condition: condition.to_string(),
+        };
+        self.model.row_level_access_controls.push(Arc::new(rule));
+        self
+    }
+
     pub fn build(self) -> Arc<Model> {
         Arc::new(self.model)
     }
 }
 
+impl SessionProperty {
+    pub fn new_required(name: &str) -> Self {
+        SessionProperty::new(name.to_string(), true, None)
+    }
+    pub fn new_optional(name: &str, default_expr: Option<String>) -> Self {
+        SessionProperty::new(name.to_string(), false, default_expr)
+    }
+}
 pub struct ColumnBuilder {
     pub column: Column,
 }
 
+#[allow(deprecated)]
 impl ColumnBuilder {
     pub fn new(name: &str, r#type: &str) -> Self {
         Self {
@@ -170,6 +199,7 @@ impl ColumnBuilder {
                 expression: None,
                 rls: None,
                 cls: None,
+                column_level_access_control: None,
             },
         }
     }
@@ -207,6 +237,7 @@ impl ColumnBuilder {
         self
     }
 
+    #[allow(deprecated)]
     pub fn row_level_security(mut self, name: &str, operator: RowLevelOperator) -> Self {
         self.column.rls = Some(RowLevelSecurity {
             name: name.to_string(),
@@ -228,6 +259,23 @@ impl ColumnBuilder {
         });
         self
     }
+
+    pub fn column_level_access_control(
+        mut self,
+        name: &str,
+        required_properties: Vec<SessionProperty>,
+        operator: ColumnLevelOperator,
+        threshold: &str,
+    ) -> Self {
+        self.column.column_level_access_control = Some(Arc::new(ColumnLevelAccessControl {
+            name: name.to_string(),
+            required_properties,
+            operator,
+            threshold: NormalizedExpr::new(threshold),
+        }));
+        self
+    }
+
     pub fn build(self) -> Arc<Column> {
         Arc::new(self.column)
     }
@@ -382,12 +430,16 @@ mod test {
     use crate::mdl::manifest::{
         Column, DataSource, JoinType, Manifest, Metric, Model, Relationship, TimeUnit, View,
     };
-    use crate::mdl::{ColumnLevelOperator, RowLevelOperator};
+    use crate::mdl::ColumnLevelOperator;
+    #[allow(deprecated)]
+    use crate::mdl::RowLevelOperator;
+    use crate::mdl::SessionProperty;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
 
     #[test]
+    #[allow(deprecated)]
     fn test_column_roundtrip() {
         let expected = ColumnBuilder::new("id", "integer")
             .relationship("test")
@@ -397,6 +449,12 @@ mod test {
             .expression("test")
             .row_level_security("SESSION_STATUS", RowLevelOperator::Equals)
             .column_level_security("SESSION_LEVEL", ColumnLevelOperator::Equals, "'NORMAL'")
+            .column_level_access_control(
+                "rlac",
+                vec![SessionProperty::new_required("session_id")],
+                ColumnLevelOperator::Equals,
+                "'NORMAL'",
+            )
             .build();
 
         let json_str = serde_json::to_string(&expected).unwrap();
@@ -452,6 +510,24 @@ mod test {
             .primary_key("id")
             .cached(true)
             .refresh_time("1h")
+            .add_row_level_access_control(
+                "rule1",
+                vec![SessionProperty::new_required("session_id")],
+                "id = @session_id",
+            )
+            .add_row_level_access_control(
+                "rule2",
+                vec![SessionProperty::new_optional("session_id_optional", None)],
+                "id = @session_id_optional",
+            )
+            .add_row_level_access_control(
+                "rule3",
+                vec![SessionProperty::new_optional(
+                    "session_id_default",
+                    Some("1".to_string()),
+                )],
+                "id = @session_id_default",
+            )
             .build();
 
         let json_str = serde_json::to_string(&model).unwrap();
@@ -621,6 +697,7 @@ mod test {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_json_serde() {
         let test_data: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "data", "mdl.json"]
             .iter()
@@ -646,6 +723,24 @@ mod test {
                         ColumnBuilder::new("orders", "orders")
                             .relationship("CustomerOrders")
                             .build(),
+                    )
+                    .add_row_level_access_control(
+                        "rule1",
+                        vec![SessionProperty::new_required("session_id")],
+                        "c_custkey = @session_id",
+                    )
+                    .add_row_level_access_control(
+                        "rule2",
+                        vec![SessionProperty::new_optional("session_id_optional", None)],
+                        "c_custkey = @session_id_optional",
+                    )
+                    .add_row_level_access_control(
+                        "rule3",
+                        vec![SessionProperty::new_optional(
+                            "session_id_default",
+                            Some("1".to_string()),
+                        )],
+                        "c_custkey = @session_id_default",
                     )
                     .primary_key("c_custkey")
                     .build(),
@@ -741,5 +836,16 @@ mod test {
             )
             .data_source(MySQL);
         assert_eq!(mdl, expected.build());
+    }
+
+    #[test]
+    fn test_session_property_roundtrip() {
+        let expected = SessionProperty::new_optional("session_id", Some("1".to_string()));
+
+        let json_str = serde_json::to_string(&expected).unwrap();
+        assert!(!json_str.contains(r#"normalizedName"#));
+        let actual: SessionProperty = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(actual.normalized_name(), actual.name.to_lowercase());
+        assert_eq!(actual, expected)
     }
 }

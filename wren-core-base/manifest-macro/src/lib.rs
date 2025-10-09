@@ -102,6 +102,12 @@ pub fn data_source(python_binding: proc_macro::TokenStream) -> proc_macro::Token
             GcsFile,
             #[serde(alias = "minio_file")]
             MinioFile,
+            #[serde(alias = "oracle")]
+            Oracle,
+            #[serde(alias = "athena")]
+            Athena,
+            #[serde(alias = "redshift")]
+            Redshift,
         }
     };
     proc_macro::TokenStream::from(expanded)
@@ -140,6 +146,8 @@ pub fn model(python_binding: proc_macro::TokenStream) -> proc_macro::TokenStream
             pub cached: bool,
             #[serde(default)]
             pub refresh_time: Option<String>,
+            #[serde(default)]
+            pub row_level_access_controls: Vec<Arc<RowLevelAccessControl>>,
         }
     };
     proc_macro::TokenStream::from(expanded)
@@ -163,6 +171,7 @@ pub fn column(python_binding: proc_macro::TokenStream) -> proc_macro::TokenStrea
         #[serde_as]
         #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
         #[serde(rename_all = "camelCase")]
+        #[allow(deprecated)]
         pub struct Column {
             pub name: String,
             pub r#type: String,
@@ -177,8 +186,11 @@ pub fn column(python_binding: proc_macro::TokenStream) -> proc_macro::TokenStrea
             pub expression: Option<String>,
             #[serde(default, with = "bool_from_int")]
             pub is_hidden: bool,
+            #[deprecated]
             pub rls: Option<RowLevelSecurity>,
+            #[deprecated]
             pub cls: Option<ColumnLevelSecurity>,
+            pub column_level_access_control: Option<Arc<ColumnLevelAccessControl>>,
         }
     };
     proc_macro::TokenStream::from(expanded)
@@ -354,6 +366,96 @@ pub fn view(python_binding: proc_macro::TokenStream) -> proc_macro::TokenStream 
 }
 
 #[proc_macro]
+pub fn row_level_access_control(
+    python_binding: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(python_binding as LitBool);
+    let python_binding = if input.value {
+        quote! {
+            #[pyclass]
+        }
+    } else {
+        quote! {}
+    };
+    let expanded = quote! {
+        #python_binding
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone)]
+        #[serde(rename_all = "camelCase")]
+        pub struct RowLevelAccessControl {
+            pub name: String,
+            #[serde(default)]
+            pub required_properties: Vec<SessionProperty>,
+            /// A string expression that can be evaluated to a boolean value
+            pub condition: String,
+        }
+    };
+    proc_macro::TokenStream::from(expanded)
+}
+
+#[proc_macro]
+pub fn session_property(python_binding: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(python_binding as LitBool);
+    let python_binding = if input.value {
+        quote! {
+            #[pyclass]
+        }
+    } else {
+        quote! {}
+    };
+    let expanded = quote! {
+        #python_binding
+        #[derive(Serialize, Debug, PartialEq, Eq, Hash, Clone)]
+        #[serde(rename_all = "camelCase")]
+        pub struct SessionProperty {
+            pub name: String,
+            pub required: bool,
+            pub default_expr: Option<String>,
+            // To avoid duplicate clone for normalized name(to_lowercase), we store it here
+            #[serde(skip_serializing, default = "String::new")]
+            pub normalized_name: String,
+        }
+
+        impl SessionProperty {
+            #[cfg(not(feature = "python-binding"))]
+            pub fn new(name: String, required: bool, default_expr: Option<String>) -> Self {
+                let normalized_name = name.to_lowercase();
+                Self {
+                    name,
+                    required,
+                    default_expr,
+                    normalized_name,
+                }
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for SessionProperty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct SessionPropertyHelper {
+                    name: String,
+                    required: bool,
+                    default_expr: Option<String>,
+                }
+
+                let helper = SessionPropertyHelper::deserialize(deserializer)?;
+                Ok(SessionProperty {
+                    normalized_name: helper.name.to_lowercase(),
+                    name: helper.name,
+                    required: helper.required,
+                    default_expr: helper.default_expr,
+                })
+            }
+        }
+    };
+    proc_macro::TokenStream::from(expanded)
+}
+
+#[proc_macro]
+#[deprecated]
 pub fn row_level_security(python_binding: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(python_binding as LitBool);
     let python_binding = if input.value {
@@ -366,8 +468,10 @@ pub fn row_level_security(python_binding: proc_macro::TokenStream) -> proc_macro
     let expanded = quote! {
         #python_binding
         #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
+        #[deprecated]
         pub struct RowLevelSecurity {
             pub name: String,
+            #[allow(deprecated)]
             pub operator: RowLevelOperator,
         }
     };
@@ -375,6 +479,7 @@ pub fn row_level_security(python_binding: proc_macro::TokenStream) -> proc_macro
 }
 
 #[proc_macro]
+#[deprecated]
 pub fn row_level_operator(python_binding: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(python_binding as LitBool);
     let python_binding = if input.value {
@@ -386,6 +491,7 @@ pub fn row_level_operator(python_binding: proc_macro::TokenStream) -> proc_macro
     };
     let expanded = quote! {
         #python_binding
+        #[deprecated]
         #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
         #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
         pub enum RowLevelOperator {
@@ -405,6 +511,7 @@ pub fn row_level_operator(python_binding: proc_macro::TokenStream) -> proc_macro
 }
 
 #[proc_macro]
+#[deprecated]
 pub fn column_level_security(python_binding: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(python_binding as LitBool);
     let python_binding = if input.value {
@@ -419,6 +526,32 @@ pub fn column_level_security(python_binding: proc_macro::TokenStream) -> proc_ma
         #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
         pub struct ColumnLevelSecurity {
             pub name: String,
+            pub operator: ColumnLevelOperator,
+            pub threshold: NormalizedExpr,
+        }
+    };
+    proc_macro::TokenStream::from(expanded)
+}
+
+#[proc_macro]
+pub fn column_level_access_control(
+    python_binding: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(python_binding as LitBool);
+    let python_binding = if input.value {
+        quote! {
+            #[pyclass]
+        }
+    } else {
+        quote! {}
+    };
+    let expanded = quote! {
+        #python_binding
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
+        #[serde(rename_all = "camelCase")]
+        pub struct ColumnLevelAccessControl {
+            pub name: String,
+            pub required_properties: Vec<SessionProperty>,
             pub operator: ColumnLevelOperator,
             pub threshold: NormalizedExpr,
         }

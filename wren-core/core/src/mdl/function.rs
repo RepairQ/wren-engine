@@ -1,4 +1,4 @@
-use datafusion::arrow::datatypes::{DataType, Field};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::Result;
 use datafusion::common::{internal_err, not_impl_err};
 use datafusion::logical_expr::function::{
@@ -6,15 +6,15 @@ use datafusion::logical_expr::function::{
 };
 use datafusion::logical_expr::{
     Accumulator, AggregateUDFImpl, ColumnarValue, DocSection, Documentation,
-    DocumentationBuilder, PartitionEvaluator, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility, WindowUDFImpl,
+    DocumentationBuilder, PartitionEvaluator, ScalarFunctionArgs, ScalarUDFImpl,
+    Signature, TypeSignature, Volatility, WindowUDFImpl,
 };
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt::Display;
 use std::str::FromStr;
 
-use crate::logical_plan::utils::map_data_type;
+use crate::logical_plan::utils::{get_coercion_type_signature, map_data_type};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash)]
 pub struct RemoteFunction {
@@ -31,7 +31,16 @@ impl RemoteFunction {
         let mut signatures = vec![];
         if let Some(param_types) = &self.param_types {
             if let Some(types) = Self::transform_param_type(param_types.as_slice()) {
-                signatures.push(TypeSignature::Exact(types));
+                let coercions = types
+                    .iter()
+                    .map(get_coercion_type_signature)
+                    .collect::<Vec<_>>();
+                if coercions.iter().any(|r| r.is_err()) {
+                    signatures.push(TypeSignature::Exact(types.clone()));
+                } else {
+                    let coercions = coercions.into_iter().map(|r| r.unwrap()).collect();
+                    signatures.push(TypeSignature::Coercible(coercions));
+                }
             }
         }
         // If the function has no siganture, we will add two default signatures: nullary and variadic any
@@ -69,7 +78,7 @@ impl Display for FunctionType {
             FunctionType::Aggregate => "aggregate".to_string(),
             FunctionType::Window => "window".to_string(),
         };
-        write!(f, "{}", str)
+        write!(f, "{str}")
     }
 }
 
@@ -81,7 +90,7 @@ impl FromStr for FunctionType {
             "scalar" => Ok(FunctionType::Scalar),
             "aggregate" => Ok(FunctionType::Aggregate),
             "window" => Ok(FunctionType::Window),
-            _ => Err(format!("Unknown function type: {}", s)),
+            _ => Err(format!("Unknown function type: {s}")),
         }
     }
 }
@@ -105,7 +114,7 @@ pub enum ReturnType {
 impl Display for ReturnType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReturnType::Specific(data_type) => write!(f, "{}", data_type),
+            ReturnType::Specific(data_type) => write!(f, "{data_type}"),
             ReturnType::SameAsInput => write!(f, "same_as_input"),
             ReturnType::SameAsInputFirstArrayElement => {
                 write!(f, "same_as_input_first_array_element")
@@ -225,7 +234,7 @@ impl ScalarUDFImpl for ByPassScalarUDF {
         self.return_type.to_data_type(arg_types)
     }
 
-    fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         internal_err!("This function should not be called")
     }
 
@@ -354,9 +363,15 @@ impl WindowUDFImpl for ByPassWindowFunction {
         internal_err!("This function should not be called")
     }
 
-    fn field(&self, field_args: WindowUDFFieldArgs) -> Result<Field> {
-        let return_type = self.return_type.to_data_type(field_args.input_types())?;
-        Ok(Field::new(field_args.name(), return_type, false))
+    fn field(&self, field_args: WindowUDFFieldArgs) -> Result<FieldRef> {
+        let return_type = self.return_type.to_data_type(
+            &field_args
+                .input_fields()
+                .iter()
+                .map(|f| f.data_type().clone())
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(Field::new(field_args.name(), return_type, false).into())
     }
 
     fn documentation(&self) -> Option<&Documentation> {
@@ -366,6 +381,7 @@ impl WindowUDFImpl for ByPassWindowFunction {
 
 #[cfg(test)]
 mod test {
+    use std::slice::from_ref;
     use std::sync::Arc;
 
     use crate::mdl::function::{
@@ -373,22 +389,24 @@ mod test {
         RemoteFunction,
     };
     use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::common::types::logical_string;
     use datafusion::common::Result;
-    use datafusion::logical_expr::TypeSignature;
+    use datafusion::logical_expr::TypeSignatureClass;
     use datafusion::logical_expr::{AggregateUDF, ScalarUDF, ScalarUDFImpl, WindowUDF};
+    use datafusion::logical_expr::{Coercion, TypeSignature};
     use datafusion::prelude::SessionContext;
 
     #[tokio::test]
     async fn test_by_pass_scalar_udf() -> Result<()> {
-        let udf = ByPassScalarUDF::new("date_diff", DataType::Int64);
+        let udf = ByPassScalarUDF::new("date_test", DataType::Int64);
         let ctx = SessionContext::new();
         ctx.register_udf(ScalarUDF::new_from_impl(udf));
 
         let plan = ctx
-            .sql("SELECT date_diff(1, 2)")
+            .sql("SELECT date_test(1, 2)")
             .await?
             .into_unoptimized_plan();
-        let expected = "Projection: date_diff(Int64(1), Int64(2))\n  EmptyRelation";
+        let expected = "Projection: date_test(Int64(1), Int64(2))\n  EmptyRelation";
         assert_eq!(format!("{plan}"), expected);
 
         ctx.register_udf(ScalarUDF::new_from_impl(ByPassScalarUDF::new(
@@ -483,9 +501,9 @@ mod test {
         );
         assert_eq!(
             udf.signature.type_signature,
-            TypeSignature::OneOf(vec![TypeSignature::Exact(vec![
-                DataType::Int32,
-                DataType::Utf8
+            TypeSignature::OneOf(vec![TypeSignature::Coercible(vec![
+                Coercion::new_exact(TypeSignatureClass::Integer),
+                Coercion::new_exact(TypeSignatureClass::Native(logical_string())),
             ])])
         );
         let doc = udf.documentation().unwrap().clone();
@@ -516,9 +534,9 @@ mod test {
         );
         assert_eq!(
             udf.signature.type_signature,
-            TypeSignature::OneOf(vec![TypeSignature::Exact(vec![
-                DataType::Int32,
-                DataType::Utf8
+            TypeSignature::OneOf(vec![TypeSignature::Coercible(vec![
+                Coercion::new_exact(TypeSignatureClass::Integer),
+                Coercion::new_exact(TypeSignatureClass::Native(logical_string())),
             ])])
         );
         let doc = udf.documentation().unwrap().clone();
@@ -575,7 +593,9 @@ mod test {
         );
         assert_eq!(
             udf.signature.type_signature,
-            TypeSignature::OneOf(vec![TypeSignature::Exact(vec![DataType::Int32])])
+            TypeSignature::OneOf(vec![TypeSignature::Coercible(vec![
+                Coercion::new_exact(TypeSignatureClass::Integer)
+            ])])
         );
         let doc = udf.documentation().unwrap().clone();
         assert_eq!(doc.description, "test function");
@@ -595,10 +615,10 @@ mod test {
         };
         let udf = ByPassScalarUDF::from(remote_function);
         let list_type =
-            DataType::List(Arc::new(Field::new("element", DataType::Int32, false)));
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
         assert_eq!(udf.name, "test");
         assert_eq!(
-            udf.return_type.to_data_type(&[list_type.clone()]).unwrap(),
+            udf.return_type.to_data_type(from_ref(&list_type)).unwrap(),
             DataType::Int32
         );
         assert_eq!(

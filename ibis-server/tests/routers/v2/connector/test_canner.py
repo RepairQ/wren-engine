@@ -4,8 +4,6 @@ import os
 import pytest
 from orjson import orjson
 
-from app.model.validator import rules
-
 """
 The Canner Enterprise must setup below:
 - A user with PAT
@@ -95,7 +93,7 @@ async def test_query(client, manifest_str):
         370,
         "O",
         "172799.49",
-        "1996-01-02 00:00:00.000000",
+        "1996-01-02",
         "1_370",
         "2024-01-01 23:59:59.000000",
         "2024-01-01 23:59:59.000000 UTC",
@@ -104,13 +102,13 @@ async def test_query(client, manifest_str):
     assert result["dtypes"] == {
         "orderkey": "int64",
         "custkey": "int64",
-        "orderstatus": "object",
-        "totalprice": "float64",
-        "orderdate": "object",
-        "order_cust_key": "object",
-        "timestamp": "object",
-        "timestamptz": "object",
-        "test_null_time": "datetime64[ns]",
+        "orderstatus": "string",
+        "totalprice": "double",
+        "orderdate": "date32[day]",
+        "order_cust_key": "string",
+        "timestamp": "timestamp[ms]",
+        "timestamptz": "timestamp[ms]",
+        "test_null_time": "timestamp[ms]",
     }
 
 
@@ -228,96 +226,6 @@ async def test_query_with_dry_run_and_invalid_sql(client, manifest_str):
     )
     assert response.status_code == 422
     assert response.text is not None
-
-
-async def test_validate_with_unknown_rule(client, manifest_str):
-    response = await client.post(
-        url=f"{base_url}/validate/unknown_rule",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-    assert (
-        response.text == f"The rule `unknown_rule` is not in the rules, rules: {rules}"
-    )
-
-
-async def test_validate_rule_column_is_valid(client, manifest_str):
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 204, response.text
-
-
-async def test_validate_rule_column_is_valid_with_invalid_parameters(
-    client, manifest_str
-):
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "X", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "X"},
-        },
-    )
-    assert response.status_code == 422
-
-
-async def test_validate_rule_column_is_valid_without_parameters(client, manifest_str):
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={"connectionInfo": connection_info, "manifestStr": manifest_str},
-    )
-    assert response.status_code == 422
-    result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "parameters"]
-    assert result["detail"][0]["msg"] == "Field required"
-
-
-async def test_validate_rule_column_is_valid_without_one_parameter(
-    client, manifest_str
-):
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `columnName`"
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `modelName`"
 
 
 async def test_dry_plan(client, manifest_str):

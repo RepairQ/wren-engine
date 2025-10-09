@@ -28,7 +28,7 @@ use tempfile::TempDir;
 use wren_core::mdl::builder::{
     ColumnBuilder, ManifestBuilder, ModelBuilder, RelationshipBuilder, ViewBuilder,
 };
-use wren_core::mdl::context::create_ctx_with_mdl;
+use wren_core::mdl::context::{create_ctx_with_mdl, Mode, SessionPropertiesRef};
 use wren_core::mdl::manifest::JoinType;
 use wren_core::mdl::AnalyzedWrenMDL;
 
@@ -77,7 +77,17 @@ impl TestContext {
             }
             _ => {
                 info!("Using default SessionContext");
-                None
+                let mdl = Arc::new(AnalyzedWrenMDL::default());
+                let ctx = create_ctx_with_mdl(
+                    &ctx,
+                    mdl.clone(),
+                    SessionPropertiesRef::default(),
+                    Mode::LocalRuntime,
+                )
+                .await
+                .ok()
+                .unwrap();
+                Some(TestContext::new(ctx, mdl))
             }
         }
     }
@@ -301,7 +311,13 @@ async fn register_ecommerce_mdl(
         manifest,
         register_tables,
     )?);
-    let ctx = create_ctx_with_mdl(ctx, Arc::clone(&analyzed_mdl), true).await?;
+    let ctx = create_ctx_with_mdl(
+        ctx,
+        Arc::clone(&analyzed_mdl),
+        Arc::new(HashMap::new()),
+        Mode::LocalRuntime,
+    )
+    .await?;
     Ok((ctx.to_owned(), analyzed_mdl))
 }
 
@@ -531,6 +547,12 @@ async fn register_tpch_mdl(
         manifest,
         register_tables,
     )?);
-    let ctx = create_ctx_with_mdl(ctx, Arc::clone(&analyzed_mdl), true).await?;
+    let ctx = create_ctx_with_mdl(
+        ctx,
+        Arc::clone(&analyzed_mdl),
+        Arc::new(HashMap::new()),
+        Mode::LocalRuntime,
+    )
+    .await?;
     Ok((ctx.to_owned(), analyzed_mdl))
 }

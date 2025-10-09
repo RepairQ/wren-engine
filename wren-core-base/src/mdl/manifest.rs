@@ -20,13 +20,15 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 #[cfg(not(feature = "python-binding"))]
+#[allow(deprecated)]
 mod manifest_impl {
     use crate::mdl::manifest::bool_from_int;
     use crate::mdl::manifest::table_reference;
     use manifest_macro::{
-        column, column_level_operator, column_level_security, data_source, join_type, manifest,
-        metric, model, normalized_expr, normalized_expr_type, relationship, row_level_operator,
-        row_level_security, time_grain, time_unit, view,
+        column, column_level_access_control, column_level_operator, column_level_security,
+        data_source, join_type, manifest, metric, model, normalized_expr, normalized_expr_type,
+        relationship, row_level_access_control, row_level_operator, row_level_security,
+        session_property, time_grain, time_unit, view,
     };
     use serde::{Deserialize, Serialize};
     use serde_with::serde_as;
@@ -44,6 +46,9 @@ mod manifest_impl {
     join_type!(false);
     time_grain!(false);
     time_unit!(false);
+    row_level_access_control!(false);
+    column_level_access_control!(false);
+    session_property!(false);
     row_level_security!(false);
     row_level_operator!(false);
     column_level_security!(false);
@@ -53,13 +58,15 @@ mod manifest_impl {
 }
 
 #[cfg(feature = "python-binding")]
+#[allow(deprecated)]
 mod manifest_impl {
     use crate::mdl::manifest::bool_from_int;
     use crate::mdl::manifest::table_reference;
     use manifest_macro::{
-        column, column_level_operator, column_level_security, data_source, join_type, manifest,
-        metric, model, normalized_expr, normalized_expr_type, relationship, row_level_operator,
-        row_level_security, time_grain, time_unit, view,
+        column, column_level_access_control, column_level_operator, column_level_security,
+        data_source, join_type, manifest, metric, model, normalized_expr, normalized_expr_type,
+        relationship, row_level_access_control, row_level_operator, row_level_security,
+        session_property, time_grain, time_unit, view,
     };
     use pyo3::pyclass;
     use serde::{Deserialize, Serialize};
@@ -79,6 +86,9 @@ mod manifest_impl {
     time_grain!(true);
     time_unit!(true);
     manifest!(true);
+    row_level_access_control!(true);
+    column_level_access_control!(true);
+    session_property!(true);
     row_level_security!(true);
     row_level_operator!(true);
     column_level_security!(true);
@@ -106,6 +116,9 @@ impl Display for DataSource {
             DataSource::S3File => write!(f, "S3_FILE"),
             DataSource::GcsFile => write!(f, "GCS_FILE"),
             DataSource::MinioFile => write!(f, "MINIO_FILE"),
+            DataSource::Oracle => write!(f, "ORACLE"),
+            DataSource::Athena => write!(f, "ATHENA"),
+            DataSource::Redshift => write!(f, "REDSHIFT"),
         }
     }
 }
@@ -236,11 +249,19 @@ impl Model {
     /// Physical columns are columns that can be selected from the model.
     /// All physical columns are visible columns, but not all visible columns are physical columns
     /// e.g. columns that are not a relationship column
-    pub fn get_physical_columns(&self) -> Vec<Arc<Column>> {
-        self.get_visible_columns()
-            .filter(|c| c.relationship.is_none())
-            .map(|c| Arc::clone(&c))
-            .collect()
+    pub fn get_physical_columns(&self, show_visible_only: bool) -> Vec<Arc<Column>> {
+        if show_visible_only {
+            self.get_visible_columns()
+                .filter(|c| c.relationship.is_none())
+                .map(|c| Arc::clone(&c))
+                .collect()
+        } else {
+            self.columns
+                .iter()
+                .filter(|c| c.relationship.is_none())
+                .map(|c| Arc::clone(&c))
+                .collect()
+        }
     }
 
     /// Return the name of the model
@@ -254,8 +275,15 @@ impl Model {
     }
 
     /// Get the specified visible column by name
-    pub fn get_column(&self, column_name: &str) -> Option<Arc<Column>> {
+    pub fn get_visible_column(&self, column_name: &str) -> Option<Arc<Column>> {
         self.get_visible_columns()
+            .find(|c| c.name == column_name)
+            .map(|c| Arc::clone(&c))
+    }
+
+    pub fn get_column(&self, column_name: &str) -> Option<Arc<Column>> {
+        self.columns
+            .iter()
             .find(|c| c.name == column_name)
             .map(|c| Arc::clone(&c))
     }
@@ -269,6 +297,22 @@ impl Model {
     pub fn table_reference(&self) -> &str {
         self.table_reference.as_deref().unwrap_or("")
     }
+
+    pub fn row_level_access_controls(&self) -> &[Arc<RowLevelAccessControl>] {
+        &self.row_level_access_controls
+    }
+}
+
+impl PartialOrd for Model {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Model {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name.cmp(&other.name)
+    }
 }
 
 impl Column {
@@ -281,6 +325,14 @@ impl Column {
     pub fn expression(&self) -> Option<&str> {
         self.expression.as_deref()
     }
+
+    pub fn column_level_access_control(&self) -> Option<Arc<ColumnLevelAccessControl>> {
+        if let Some(ref cla) = &self.column_level_access_control {
+            Some(Arc::clone(cla))
+        } else {
+            None
+        }
+    }
 }
 
 impl Metric {
@@ -292,6 +344,12 @@ impl Metric {
 impl View {
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl SessionProperty {
+    pub fn normalized_name(&self) -> &str {
+        &self.normalized_name
     }
 }
 
