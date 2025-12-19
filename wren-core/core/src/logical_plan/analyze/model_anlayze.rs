@@ -1,5 +1,7 @@
 use crate::logical_plan::analyze::plan::ModelPlanNode;
+use crate::logical_plan::analyze::scope::{ScopeId, ScopeManager};
 use crate::logical_plan::utils::{belong_to_mdl, expr_to_columns};
+use crate::mdl::context::SessionPropertiesRef;
 use crate::mdl::utils::quoted;
 use crate::mdl::{AnalyzedWrenMDL, Dataset, SessionStateRef};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -14,8 +16,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::sql::TableReference;
-use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ use std::sync::Arc;
 pub struct ModelAnalyzeRule {
     analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
     session_state: SessionStateRef,
+    properties: SessionPropertiesRef,
 }
 
 impl Debug for ModelAnalyzeRule {
@@ -43,9 +45,14 @@ impl Debug for ModelAnalyzeRule {
 
 impl AnalyzerRule for ModelAnalyzeRule {
     fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
-        let root = RefCell::new(Scope::new());
-        self.analyze_scope(plan, &root)?
-            .map_data(|plan| self.analyze_model(plan, &root).data())?
+        let mut scope_manager = ScopeManager::new();
+        let root_scope_id = scope_manager.create_root_scope();
+
+        self.analyze_scope(plan, &mut scope_manager, root_scope_id)?
+            .map_data(|plan| {
+                self.analyze_model(plan, &mut scope_manager, root_scope_id)
+                    .data()
+            })?
             .map_data(|plan| {
                 plan.transform_up_with_subqueries(&|plan| -> Result<
                     Transformed<LogicalPlan>,
@@ -67,10 +74,12 @@ impl ModelAnalyzeRule {
     pub fn new(
         analyzed_wren_mdl: Arc<AnalyzedWrenMDL>,
         session_state: SessionStateRef,
+        properties: SessionPropertiesRef,
     ) -> Self {
         Self {
             analyzed_wren_mdl,
             session_state,
+            properties,
         }
     }
 
@@ -84,28 +93,34 @@ impl ModelAnalyzeRule {
     fn analyze_scope(
         &self,
         plan: LogicalPlan,
-        root: &RefCell<Scope>,
+        scope_manager: &mut ScopeManager,
+        current_scope_id: ScopeId,
     ) -> Result<Transformed<LogicalPlan>> {
         plan.transform_up(&mut |plan| -> Result<Transformed<LogicalPlan>> {
-            let plan = self.analyze_scope_internal(plan, root)?.data;
+            let plan = self
+                .analyze_scope_internal(plan, scope_manager, current_scope_id)?
+                .data;
             plan.map_subqueries(|plan| {
                 if let LogicalPlan::Subquery(Subquery {
                     subquery,
                     outer_ref_columns,
+                    ..
                 }) = &plan
                 {
                     outer_ref_columns.iter().try_for_each(|expr| {
-                        let mut root_mut = root.borrow_mut();
-                        self.collect_required_column(expr.clone(), &mut root_mut)
+                        self.collect_required_column(
+                            expr.clone(),
+                            scope_manager,
+                            current_scope_id,
+                        )
                     })?;
                     let child_scope =
-                        RefCell::new(Scope::new_child(RefCell::clone(root)));
+                        scope_manager.create_child_scope(current_scope_id)?;
                     self.analyze_scope(
                         Arc::unwrap_or_clone(Arc::clone(subquery)),
-                        &child_scope,
+                        scope_manager,
+                        child_scope,
                     )?;
-                    let mut root_mut = root.borrow_mut();
-                    root_mut.push_child(child_scope);
                 }
                 Ok(Transformed::no(plan))
             })
@@ -116,8 +131,10 @@ impl ModelAnalyzeRule {
     fn analyze_scope_internal(
         &self,
         plan: LogicalPlan,
-        scope: &RefCell<Scope>,
+        scope_manager: &mut ScopeManager,
+        current_scope_id: ScopeId,
     ) -> Result<Transformed<LogicalPlan>> {
+        let scope_mut = scope_manager.get_scope_mut(current_scope_id)?;
         match &plan {
             LogicalPlan::TableScan(table_scan) => {
                 if belong_to_mdl(
@@ -125,7 +142,6 @@ impl ModelAnalyzeRule {
                     table_scan.table_name.clone(),
                     Arc::clone(&self.session_state),
                 ) {
-                    let mut scope_mut = scope.borrow_mut();
                     if let Some(model) = self
                         .analyzed_wren_mdl
                         .wren_mdl
@@ -143,7 +159,6 @@ impl ModelAnalyzeRule {
                 }
             }
             LogicalPlan::Join(Join { on, filter, .. }) => {
-                let mut scope_mut = scope.borrow_mut();
                 let mut accum = HashSet::new();
                 on.iter().try_for_each(|expr| {
                     expr_to_columns(&expr.0, &mut accum)?;
@@ -156,33 +171,39 @@ impl ModelAnalyzeRule {
                 accum.iter().try_for_each(|expr| {
                     self.collect_required_column(
                         Expr::Column(expr.clone()),
-                        &mut scope_mut,
+                        scope_manager,
+                        current_scope_id,
                     )
                 })?;
                 Ok(Transformed::no(plan))
             }
             LogicalPlan::Projection(projection) => {
-                let mut scope_mut = scope.borrow_mut();
                 projection.expr.iter().try_for_each(|expr| {
                     let mut acuum = HashSet::new();
                     expr_to_columns(expr, &mut acuum)?;
                     acuum.into_iter().try_for_each(|expr| {
-                        self.collect_required_column(Expr::Column(expr), &mut scope_mut)
+                        self.collect_required_column(
+                            Expr::Column(expr),
+                            scope_manager,
+                            current_scope_id,
+                        )
                     })
                 })?;
                 Ok(Transformed::no(plan))
             }
             LogicalPlan::Filter(filter) => {
-                let mut scope_mut = scope.borrow_mut();
                 let mut acuum = HashSet::new();
                 expr_to_columns(&filter.predicate, &mut acuum)?;
                 acuum.into_iter().try_for_each(|expr| {
-                    self.collect_required_column(Expr::Column(expr), &mut scope_mut)
+                    self.collect_required_column(
+                        Expr::Column(expr),
+                        scope_manager,
+                        current_scope_id,
+                    )
                 })?;
                 Ok(Transformed::no(plan))
             }
             LogicalPlan::Aggregate(aggregate) => {
-                let mut scope_mut = scope.borrow_mut();
                 let mut accum = HashSet::new();
                 aggregate.aggr_expr.iter().for_each(|expr| {
                     Expr::add_column_refs(expr, &mut accum);
@@ -193,13 +214,13 @@ impl ModelAnalyzeRule {
                 accum.iter().try_for_each(|expr| {
                     self.collect_required_column(
                         Expr::Column(expr.to_owned().clone()),
-                        &mut scope_mut,
+                        scope_manager,
+                        current_scope_id,
                     )
                 })?;
                 Ok(Transformed::no(plan))
             }
             LogicalPlan::SubqueryAlias(subquery_alias) => {
-                let mut scope_mut = scope.borrow_mut();
                 if let LogicalPlan::TableScan(table_scan) =
                     Arc::unwrap_or_clone(Arc::clone(&subquery_alias.input))
                 {
@@ -224,7 +245,6 @@ impl ModelAnalyzeRule {
                 Ok(Transformed::no(plan))
             }
             LogicalPlan::Window(window) => {
-                let mut scope_mut = scope.borrow_mut();
                 window
                     .window_expr
                     .iter()
@@ -236,7 +256,8 @@ impl ModelAnalyzeRule {
                     .try_for_each(|col| {
                         self.collect_required_column(
                             Expr::Column(col.to_owned()),
-                            &mut scope_mut,
+                            scope_manager,
+                            current_scope_id,
                         )
                     })?;
                 Ok(Transformed::no(plan))
@@ -249,7 +270,8 @@ impl ModelAnalyzeRule {
     fn collect_required_column(
         &self,
         expr: Expr,
-        scope: &mut RefMut<Scope>,
+        scope_manager: &mut ScopeManager,
+        current_scope_id: ScopeId,
     ) -> Result<()> {
         match expr {
             Expr::Column(Column {
@@ -268,13 +290,11 @@ impl ModelAnalyzeRule {
                     .get_view(relation.table())
                     .is_none()
                 {
-                    let added = scope.add_required_column(
+                    scope_manager.add_required_column(
+                        current_scope_id,
                         relation.clone(),
                         Expr::Column(Column::new(Some(relation.clone()), name)),
                     )?;
-                    if !added {
-                        return plan_err!("Relation {} isn't visited", relation);
-                    }
                 }
             }
             // It is possible that the column is a rebase column from the aggregation or join
@@ -286,7 +306,11 @@ impl ModelAnalyzeRule {
                 // do nothing
             }
             Expr::OuterReferenceColumn(_, column) => {
-                self.collect_required_column(Expr::Column(column), scope)?;
+                self.collect_required_column(
+                    Expr::Column(column),
+                    scope_manager,
+                    current_scope_id,
+                )?;
             }
             _ => return plan_err!("Invalid column expression: {}", expr),
         }
@@ -299,21 +323,25 @@ impl ModelAnalyzeRule {
     fn analyze_model(
         &self,
         plan: LogicalPlan,
-        root: &RefCell<Scope>,
+        scope_manager: &mut ScopeManager,
+        current_scope_id: ScopeId,
     ) -> Result<Transformed<LogicalPlan>> {
         plan.transform_up(&mut |plan| -> Result<Transformed<LogicalPlan>> {
-            let plan = self.analyze_model_internal(plan, root)?.data;
+            let plan = self
+                .analyze_model_internal(plan, scope_manager, current_scope_id)?
+                .data;
             // If the plan contains subquery, we should analyze the subquery recursively
-            let mut root = root.borrow_mut();
             plan.map_subqueries(|plan| {
                 if let LogicalPlan::Subquery(subquery) = &plan {
-                    let Some(child_scope) = root.pop_child() else {
+                    let root_scope = scope_manager.get_scope_mut(current_scope_id)?;
+                    let Some(child_scope_id) = root_scope.pop_child_scope() else {
                         return internal_err!("No child scope found for subquery");
                     };
                     let transformed = self
                         .analyze_model(
                             Arc::unwrap_or_clone(Arc::clone(&subquery.subquery)),
-                            &child_scope,
+                            scope_manager,
+                            child_scope_id,
                         )?
                         .data;
                     return Ok(Transformed::yes(LogicalPlan::Subquery(
@@ -329,7 +357,8 @@ impl ModelAnalyzeRule {
     fn analyze_model_internal(
         &self,
         plan: LogicalPlan,
-        scope: &RefCell<Scope>,
+        scope_manager: &mut ScopeManager,
+        current_scope_id: ScopeId,
     ) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, alias, .. }) => {
@@ -338,9 +367,13 @@ impl ModelAnalyzeRule {
                 //      SubqueryAlias -> SubqueryAlias -> Extension -> ModelPlanNode
                 // to get the correct required columns
                 match Arc::unwrap_or_clone(Arc::clone(&input)) {
-                    LogicalPlan::SubqueryAlias(subquery_alias) => {
-                        self.analyze_subquery_alias_model(subquery_alias, scope, alias)
-                    }
+                    LogicalPlan::SubqueryAlias(subquery_alias) => self
+                        .analyze_subquery_alias_model(
+                            subquery_alias,
+                            scope_manager,
+                            current_scope_id,
+                            alias,
+                        ),
                     LogicalPlan::TableScan(table_scan) => {
                         let model_plan = self
                             .analyze_table_scan(
@@ -348,7 +381,8 @@ impl ModelAnalyzeRule {
                                 Arc::clone(&self.session_state),
                                 table_scan,
                                 Some(alias.clone()),
-                                scope,
+                                scope_manager,
+                                current_scope_id,
                             )?
                             .data;
                         let subquery =
@@ -365,7 +399,8 @@ impl ModelAnalyzeRule {
                 Arc::clone(&self.session_state),
                 table_scan,
                 None,
-                scope,
+                scope_manager,
+                current_scope_id,
             ),
             LogicalPlan::Join(join) => {
                 let left = match Arc::unwrap_or_clone(join.left) {
@@ -375,7 +410,8 @@ impl ModelAnalyzeRule {
                             Arc::clone(&self.session_state),
                             table_scan,
                             None,
-                            scope,
+                            scope_manager,
+                            current_scope_id,
                         )?
                         .data
                     }
@@ -389,7 +425,8 @@ impl ModelAnalyzeRule {
                             Arc::clone(&self.session_state),
                             table_scan,
                             None,
-                            scope,
+                            scope_manager,
+                            current_scope_id,
                         )?
                         .data
                     }
@@ -403,7 +440,7 @@ impl ModelAnalyzeRule {
                     schema: join.schema,
                     filter: join.filter,
                     join_constraint: join.join_constraint,
-                    null_equals_null: join.null_equals_null,
+                    null_equality: join.null_equality,
                 })))
             }
             _ => Ok(Transformed::no(plan)),
@@ -416,7 +453,8 @@ impl ModelAnalyzeRule {
         session_state_ref: SessionStateRef,
         table_scan: TableScan,
         alias: Option<TableReference>,
-        scope: &RefCell<Scope>,
+        scope_manager: &mut ScopeManager,
+        current_scope_id: ScopeId,
     ) -> Result<Transformed<LogicalPlan>> {
         if belong_to_mdl(
             &analyzed_wren_mdl.wren_mdl(),
@@ -426,15 +464,17 @@ impl ModelAnalyzeRule {
             let table_name = table_scan.table_name.table();
             if let Some(model) = analyzed_wren_mdl.wren_mdl.get_model(table_name) {
                 let table_ref = alias.unwrap_or(table_scan.table_name.clone());
-                let scope = scope.borrow();
                 let field: Vec<Expr> = if let Some(used_columns) =
-                    scope.try_get_required_columns(&table_ref)
+                    scope_manager.try_get_required_columns(current_scope_id, &table_ref)
                 {
                     used_columns.iter().cloned().collect()
                 } else {
                     // If the required columns are not found in the current scope but the table is visited,
                     // it could be a count(*) query
-                    if scope.try_get_visited_dataset(&table_ref).is_none() {
+                    if scope_manager
+                        .try_get_visited_dataset(current_scope_id, &table_ref)
+                        .is_none()
+                    {
                         return internal_err!(
                             "Table {} not found in the visited dataset and required columns map",
                             table_ref
@@ -449,6 +489,7 @@ impl ModelAnalyzeRule {
                         Some(LogicalPlan::TableScan(table_scan.clone())),
                         Arc::clone(&self.analyzed_wren_mdl),
                         Arc::clone(&self.session_state),
+                        Arc::clone(&self.properties),
                     )?),
                 });
                 let subquery = LogicalPlanBuilder::from(model_plan)
@@ -470,7 +511,8 @@ impl ModelAnalyzeRule {
     fn analyze_subquery_alias_model(
         &self,
         subquery_alias: SubqueryAlias,
-        scope: &RefCell<Scope>,
+        scope_manager: &mut ScopeManager,
+        current_scope_id: ScopeId,
         alias: TableReference,
     ) -> Result<Transformed<LogicalPlan>> {
         let SubqueryAlias { input, .. } = subquery_alias;
@@ -483,15 +525,17 @@ impl ModelAnalyzeRule {
                     .wren_mdl()
                     .get_model(model_node.plan_name())
                 {
-                    let scope = scope.borrow();
                     let field: Vec<Expr> = if let Some(used_columns) =
-                        scope.try_get_required_columns(&alias)
+                        scope_manager.try_get_required_columns(current_scope_id, &alias)
                     {
                         used_columns.iter().cloned().collect()
                     } else {
                         // If the required columns are not found in the current scope but the table is visited,
                         // it could be a count(*) query
-                        if scope.try_get_visited_dataset(&alias).is_none() {
+                        if scope_manager
+                            .try_get_visited_dataset(current_scope_id, &alias)
+                            .is_none()
+                        {
                             return internal_err!(
                                     "Table {} not found in the visited dataset and required columns map",
                                     alias);
@@ -505,6 +549,7 @@ impl ModelAnalyzeRule {
                             None,
                             Arc::clone(&self.analyzed_wren_mdl),
                             Arc::clone(&self.session_state),
+                            Arc::clone(&self.properties),
                         )?),
                     });
                     let subquery =
@@ -548,6 +593,7 @@ impl ModelAnalyzeRule {
             LogicalPlan::Subquery(Subquery {
                 subquery,
                 outer_ref_columns,
+                spans,
             }) => {
                 let subquery = self
                     .remove_wren_catalog_schema_prefix_and_refresh_schema(
@@ -557,6 +603,7 @@ impl ModelAnalyzeRule {
                 Ok(Transformed::yes(LogicalPlan::Subquery(Subquery {
                     subquery: Arc::new(subquery),
                     outer_ref_columns,
+                    spans,
                 })))
             }
             LogicalPlan::Distinct(Distinct::On(DistinctOn {
@@ -678,6 +725,7 @@ impl ModelAnalyzeRule {
                 expr,
                 relation,
                 name,
+                metadata,
             }) => {
                 let expr =
                     self.map_column_and_rewrite_qualifier(*expr, alias_model, schema)?;
@@ -685,6 +733,7 @@ impl ModelAnalyzeRule {
                     expr: Box::new(expr.data),
                     relation,
                     name,
+                    metadata,
                 })))
             }
             _ => expr.map_children(|e| {
@@ -760,147 +809,6 @@ impl ModelAnalyzeRule {
                 Self::find_alias_model(input)
             }
             _ => None,
-        }
-    }
-}
-
-/// [Scope] is used to collect the required columns for models and visited tables in a query scope.
-/// A query scope means is a full query body contain projection, relation. e.g.
-///    SELECT a, b, c FROM table
-///
-/// To avoid the table name be ambiguous, the relation name should be unique in the scope.
-/// The relation of parent scope can be accessed by the child scope.
-/// The child scope can also add the required columns to the parent scope.
-#[derive(Clone, Debug, Default)]
-pub struct Scope {
-    /// The columns required by the dataset
-    required_columns: HashMap<TableReference, HashSet<Expr>>,
-    /// The Wren dataset visited in the scope (only the Wren dataset)
-    visited_dataset: HashMap<TableReference, Dataset>,
-    /// The table name visited in the scope (not only the Wren dataset)
-    visited_tables: HashSet<TableReference>,
-    /// The parent scope
-    parent: Option<Box<RefCell<Scope>>>,
-    childs: VecDeque<RefCell<Scope>>,
-}
-
-impl Scope {
-    pub fn new() -> Self {
-        Self {
-            required_columns: HashMap::new(),
-            visited_dataset: HashMap::new(),
-            visited_tables: HashSet::new(),
-            parent: None,
-            childs: VecDeque::new(),
-        }
-    }
-
-    pub fn new_child(parent: RefCell<Scope>) -> Self {
-        Self {
-            required_columns: HashMap::new(),
-            visited_dataset: HashMap::new(),
-            visited_tables: HashSet::new(),
-            parent: Some(Box::new(parent)),
-            childs: VecDeque::new(),
-        }
-    }
-
-    pub fn pop_child(&mut self) -> Option<RefCell<Scope>> {
-        self.childs.pop_front()
-    }
-
-    pub fn push_child(&mut self, child: RefCell<Scope>) {
-        self.childs.push_back(child);
-    }
-
-    /// Add the required column to the scope, return true if the column is added successfully.
-    /// If the table isn't exist in the current scope, try to add the column to the parent scope.
-    /// If the table is not visited by the parent and the current scope, return false
-    pub fn add_required_column(
-        &mut self,
-        table_ref: TableReference,
-        expr: Expr,
-    ) -> Result<bool> {
-        let added = if self.visited_dataset.contains_key(&table_ref) {
-            self.required_columns
-                .entry(table_ref.clone())
-                .or_default()
-                .insert(expr);
-            true
-        } else if let Some(ref parent) = &self.parent {
-            parent
-                .clone()
-                .borrow_mut()
-                .add_required_column(table_ref.clone(), expr)?
-        } else {
-            false
-        };
-
-        if added {
-            Ok(true)
-        } else if self.try_get_visited_table(&table_ref).is_some() {
-            // If the table is visited but the dataset is not found, it could be a subquery alias
-            Ok(true)
-        } else {
-            // the table is not visited by both the parent and the current scope
-            Ok(false)
-        }
-    }
-
-    pub fn add_visited_dataset(&mut self, table_ref: TableReference, dataset: Dataset) {
-        self.visited_dataset.insert(table_ref, dataset);
-    }
-
-    pub fn add_visited_table(&mut self, table_ref: TableReference) {
-        self.visited_tables.insert(table_ref);
-    }
-
-    pub fn try_get_required_columns(
-        &self,
-        table_ref: &TableReference,
-    ) -> Option<HashSet<Expr>> {
-        let try_local = self.required_columns.get(table_ref).cloned();
-
-        if try_local.is_some() {
-            return try_local;
-        }
-
-        if let Some(ref parent) = &self.parent {
-            let scope = parent.borrow();
-            scope.try_get_required_columns(table_ref)
-        } else {
-            None
-        }
-    }
-
-    pub fn try_get_visited_dataset(&self, table_ref: &TableReference) -> Option<Dataset> {
-        let try_local = self.visited_dataset.get(table_ref).cloned();
-
-        if try_local.is_some() {
-            return try_local;
-        }
-
-        if let Some(ref parent) = &self.parent {
-            let scope = parent.borrow();
-            scope.try_get_visited_dataset(table_ref)
-        } else {
-            None
-        }
-    }
-
-    pub fn try_get_visited_table(
-        &self,
-        table_ref: &TableReference,
-    ) -> Option<TableReference> {
-        if self.visited_tables.contains(table_ref) {
-            return Some(table_ref.clone());
-        }
-
-        if let Some(ref parent) = &self.parent {
-            let scope = parent.borrow();
-            scope.try_get_visited_table(table_ref)
-        } else {
-            None
         }
     }
 }

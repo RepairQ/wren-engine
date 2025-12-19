@@ -1,16 +1,17 @@
 [tool.poetry]
 name = "wren-engine"
-version = "0.15.12"
+version = "0.21.0"
 description = ""
 authors = ["Canner <dev@cannerdata.com>"]
 readme = "README.md"
-packages = [{ include = "app" }]
+packages = [{ include = "app" }, { include = "wren" }]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.12"
-fastapi = { version = "0.115.12", extras = ["standard"] }
+fastapi = { version = "0.116.1", extras = ["standard"] }
 pydantic = "2.10.6"
-ibis-framework = { version = "10.3.1", extras = [
+ibis-framework = { git = "https://github.com/Canner/ibis.git", branch = "canner/10.8.1", extras = [
+  "athena",
   "bigquery",
   "clickhouse",
   "mssql",
@@ -25,20 +26,42 @@ httpx = "0.28.1"
 python-dotenv = "1.0.1"
 orjson = "3.10.16"
 pandas = "2.2.3"
+geopandas = "^1.0.1"
+geoalchemy2 = "^0.17.1"
 sqlglot = { extras = [
   "rs",
-], version = ">=23.4,<26.5" } # the version should follow the ibis-framework
+], version = ">=27.8.0, <28.0.0" } # the version should follow the ibis-framework
 loguru = "0.7.3"
 asgi-correlation-id = "4.3.4"
 gql = { extras = ["aiohttp"], version = "3.5.2" }
-anyio = "4.9.0"
-duckdb = "1.2.1"
+anyio = "4.10.0"
+duckdb = "1.3.2"
 opendal = ">=0.45"
-oracledb = "3.0.0"
+oracledb = "3.3.0"
 mysqlclient = { version = ">=2.2.4,<3", optional = true }
 opentelemetry-api = ">=1.30.0"
 opentelemetry-sdk = ">=1.30.0"
+uvicorn = "^0.35.0"
+gunicorn = "^23.0.0"
+uvicorn-worker = "^0.3.0"
 jinja2 = ">=3.1.6"
+redshift_connector = "2.1.7"
+datafusion = "^47.0.0, <49.0.0"
+
+[tool.poetry.group.jupyter]
+optional = true
+
+[tool.poetry.group.jupyter.dependencies]
+jupyter = ">=1.0.0"
+jupyterlab = ">=4.0.0"
+ipykernel = ">=6.0.0"
+ipywidgets = ">=8.0.0"
+matplotlib = ">=3.5.0"
+seaborn = ">=0.11.0"
+plotly = ">=5.0.0"
+
+[tool.poetry.group.dev]
+optional = true
 
 [tool.poetry.group.dev.dependencies]
 pytest = "8.3.5"
@@ -57,10 +80,12 @@ trino = ">=0.321,<1"
 psycopg2 = ">=2.8.4,<3"
 clickhouse-connect = "0.8.15"
 asgi-lifespan = "2.1.0"
+polars = ">=1.32.0"
 
 [tool.pytest.ini_options]
 addopts = ["--strict-markers"]
 markers = [
+  "athena: mark a test as an athena test",
   "bigquery: mark a test as a bigquery test",
   "canner: mark a test as a canner test",
   "clickhouse: mark a test as a clickhouse test",
@@ -73,6 +98,7 @@ markers = [
   "type_mapping: mark a test as type mapping override test",
   "date_arithmetic: mark a test as date arithmetic transformation test",
   "postgres: mark a test as a postgres test",
+  "redshift: mark a test as a redshift test",
   "snowflake: mark a test as a snowflake test",
   "trino: mark a test as a trino test",
   "local_file: mark a test as a local file test",
@@ -85,10 +111,17 @@ markers = [
 [tool.ruff]
 line-length = 88
 target-version = "py311"
-exclude = ["tools/"]
+exclude = [
+  "tools/",
+  "*.ipynb",
+  "notebooks/",
+  "**/notebooks/**",
+  "**/.ipynb_checkpoints/**",
+]
 
 [tool.ruff.lint]
 select = [
+  "B",   # flake8-bugbear (Cython compatible)
   "C4",  # comprehensions
   "D",   # pydocstyle
   "E",   # pycodestyle
@@ -110,7 +143,7 @@ select = [
   "T10", # flake8-debugger
   "T20", # flake8-print
   "TID", # flake8-tidy-imports
-  "UP",  # pyupgrade
+  "UP",  # pyupgrade (check the modern python usage)
   "YTT", # flake8-2020
 ]
 ignore = [
@@ -162,7 +195,7 @@ ignore = [
   "SIM118",  # remove .keys() calls from dictionaries
   "SIM300",  # yoda conditions
   "UP007",   # Optional[str] -> str | None
-  "UP038",   # non-pep604-isinstance, results in slower code
+  "UP045",   # non-pep604-annotation-optional
   "W191",    # indentation contains tabs
 ]
 # none of these codes will be automatically fixed by ruff

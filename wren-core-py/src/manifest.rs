@@ -13,12 +13,31 @@ pub fn to_json_base64(mdl: Manifest) -> Result<String, CoreError> {
     Ok(mdl_base64)
 }
 
+#[pyfunction]
 /// Convert a base64 encoded JSON string to a manifest object.
 pub fn to_manifest(mdl_base64: &str) -> Result<Manifest, CoreError> {
     let decoded_bytes = BASE64_STANDARD.decode(mdl_base64)?;
     let mdl_json = String::from_utf8(decoded_bytes)?;
     let manifest = serde_json::from_str::<Manifest>(&mdl_json)?;
     Ok(manifest)
+}
+
+/// Check if the MDL can be used by the v2 wren core. If there are any access controls rules,
+/// the MDL should be used by the v3 wren core only.
+#[pyfunction]
+pub fn is_backward_compatible(mdl_base64: &str) -> Result<bool, CoreError> {
+    let manifest = to_manifest(mdl_base64)?;
+    let ralc_exist = manifest
+        .models
+        .iter()
+        .all(|model| model.row_level_access_controls().is_empty());
+    let clac_exist = manifest.models.iter().all(|model| {
+        model
+            .columns
+            .iter()
+            .all(|column| column.column_level_access_control().is_none())
+    });
+    Ok(ralc_exist && clac_exist)
 }
 
 #[cfg(test)]
@@ -43,6 +62,7 @@ mod tests {
                     primary_key: None,
                     cached: false,
                     refresh_time: None,
+                    row_level_access_controls: vec![],
                 }),
                 Arc::from(Model {
                     name: "model_2".to_string(),
@@ -53,6 +73,7 @@ mod tests {
                     primary_key: None,
                     cached: false,
                     refresh_time: None,
+                    row_level_access_controls: vec![],
                 }),
             ],
             relationships: vec![],

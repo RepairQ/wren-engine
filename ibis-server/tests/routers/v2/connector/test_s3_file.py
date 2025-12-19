@@ -116,16 +116,16 @@ async def test_query(client, manifest_str, connection_info):
         370,
         "O",
         "172799.49",
-        "1996-01-02 00:00:00.000000",
+        "1996-01-02",
         "1_370",
     ]
     assert result["dtypes"] == {
         "orderkey": "int32",
         "custkey": "int32",
-        "orderstatus": "object",
-        "totalprice": "float64",
-        "orderdate": "object",
-        "order_cust_key": "object",
+        "orderstatus": "string",
+        "totalprice": "decimal128(15, 2)",
+        "orderdate": "date32[day]",
+        "order_cust_key": "string",
     }
 
 
@@ -163,7 +163,7 @@ async def test_query_calculated_field(client, manifest_str, connection_info):
     ]
     assert result["dtypes"] == {
         "custkey": "int32",
-        "sum_totalprice": "float64",
+        "sum_totalprice": "decimal128(38, 9)",
     }
 
 
@@ -292,7 +292,10 @@ async def test_unsupported_format(client):
         },
     )
     assert response.status_code == 422
-    assert response.text == "Failed to list files: Unsupported format: unsupported"
+    assert (
+        response.json()["message"]
+        == "Failed to list files: Unsupported format: unsupported"
+    )
 
 
 async def test_list_parquet_files(client):

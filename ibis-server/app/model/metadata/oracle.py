@@ -1,4 +1,5 @@
 import ibis
+from loguru import logger
 
 from typing import List
 from app.model import OracleConnectionInfo
@@ -12,6 +13,40 @@ from app.model.metadata.dto import (
     TableProperties,
 )
 from app.model.metadata.metadata import Metadata
+
+# Oracle-specific type mapping
+# Oracle 19c doesn't support TIMESTAMPTZ operations with simple string literals
+# Map timezone-aware types to plain TIMESTAMP to avoid ORA-01843 errors
+ORACLE_TYPE_MAPPING = {
+    "CHAR": RustWrenEngineColumnType.CHAR,
+    "NCHAR": RustWrenEngineColumnType.CHAR,
+    "VARCHAR2": RustWrenEngineColumnType.VARCHAR,
+    "NVARCHAR2": RustWrenEngineColumnType.VARCHAR,
+    "CLOB": RustWrenEngineColumnType.TEXT,
+    "NCLOB": RustWrenEngineColumnType.TEXT,
+    "NUMBER": RustWrenEngineColumnType.DECIMAL,
+    "FLOAT": RustWrenEngineColumnType.FLOAT8,
+    "BINARY_FLOAT": RustWrenEngineColumnType.FLOAT8,
+    "BINARY_DOUBLE": RustWrenEngineColumnType.DOUBLE,
+    "DATE": RustWrenEngineColumnType.TIMESTAMP,  # Oracle DATE includes time.
+    "TIMESTAMP": RustWrenEngineColumnType.TIMESTAMP,
+    "TIMESTAMP WITH TIME ZONE": RustWrenEngineColumnType.TIMESTAMP,  # Changed from TIMESTAMPTZ for Oracle 19c compatibility
+    "TIMESTAMP WITH LOCAL TIME ZONE": RustWrenEngineColumnType.TIMESTAMP,  # Changed from TIMESTAMPTZ for Oracle 19c compatibility
+    "INTERVAL YEAR TO MONTH": RustWrenEngineColumnType.INTERVAL,
+    "INTERVAL DAY TO SECOND": RustWrenEngineColumnType.INTERVAL,
+    "BLOB": RustWrenEngineColumnType.BYTEA,
+    "BFILE": RustWrenEngineColumnType.BYTEA,
+    "RAW": RustWrenEngineColumnType.BYTEA,
+    "LONG RAW": RustWrenEngineColumnType.BYTEA,
+    "ROWID": RustWrenEngineColumnType.CHAR,
+    "UROWID": RustWrenEngineColumnType.CHAR,
+    "JSON": RustWrenEngineColumnType.JSON,
+    "OSON": RustWrenEngineColumnType.JSON,
+    "VARCHAR2 WITH JSON": RustWrenEngineColumnType.JSON,
+    "BLOB WITH JSON": RustWrenEngineColumnType.JSON,
+    "CLOB WITH JSON": RustWrenEngineColumnType.JSON,
+}
+
 
 class OracleMetadata(Metadata):
     """
@@ -308,41 +343,29 @@ class OracleMetadata(Metadata):
     ):
         return f"{table_name}_{column_name}_{referenced_table_name}_{referenced_column_name}"
 
-    def _transform_column_type(self, data_type):
+    def _transform_column_type(self, data_type: str) -> RustWrenEngineColumnType:
+        """Transform Oracle data type to RustWrenEngineColumnType.
+
+        Oracle 19c compatibility: Strips precision/scale qualifiers and maps
+        timezone-aware types to plain TIMESTAMP to avoid ORA-01843 errors.
+
+        Args:
+            data_type: The Oracle data type string (may include precision like "TIMESTAMP(6)")
+
+        Returns:
+            The corresponding RustWrenEngineColumnType
+        """
         # Strip precision/scale qualifiers from Oracle types before mapping
         # e.g., "TIMESTAMP(6)" -> "TIMESTAMP", "NUMBER(10,2)" -> "NUMBER"
         import re
         normalized_type = re.sub(r'\([^)]*\)', '', data_type.upper()).strip()
 
-        switcher = {
-            "CHAR": RustWrenEngineColumnType.CHAR,
-            "NCHAR": RustWrenEngineColumnType.CHAR,
-            "VARCHAR2": RustWrenEngineColumnType.VARCHAR,
-            "NVARCHAR2": RustWrenEngineColumnType.VARCHAR,
-            "CLOB": RustWrenEngineColumnType.TEXT,
-            "NCLOB": RustWrenEngineColumnType.TEXT,
-            "NUMBER": RustWrenEngineColumnType.DECIMAL,
-            "FLOAT": RustWrenEngineColumnType.FLOAT8,
-            "BINARY_FLOAT": RustWrenEngineColumnType.FLOAT8,
-            "BINARY_DOUBLE": RustWrenEngineColumnType.DOUBLE,
-            "DATE": RustWrenEngineColumnType.TIMESTAMP,  # Oracle DATE includes time.
-            "TIMESTAMP": RustWrenEngineColumnType.TIMESTAMP,
-            # Oracle 19c doesn't support TIMESTAMPTZ operations with simple string literals
-            # Map timezone-aware types to plain TIMESTAMP to avoid ORA-01843 errors
-            "TIMESTAMP WITH TIME ZONE": RustWrenEngineColumnType.TIMESTAMP,
-            "TIMESTAMP WITH LOCAL TIME ZONE": RustWrenEngineColumnType.TIMESTAMP,
-            "INTERVAL YEAR TO MONTH": RustWrenEngineColumnType.INTERVAL,
-            "INTERVAL DAY TO SECOND": RustWrenEngineColumnType.INTERVAL,
-            "BLOB": RustWrenEngineColumnType.BYTEA,
-            "BFILE": RustWrenEngineColumnType.BYTEA,
-            "RAW": RustWrenEngineColumnType.BYTEA,
-            "LONG RAW": RustWrenEngineColumnType.BYTEA,
-            "ROWID": RustWrenEngineColumnType.CHAR,
-            "UROWID": RustWrenEngineColumnType.CHAR,
-            "JSON": RustWrenEngineColumnType.JSON,
-            "OSON": RustWrenEngineColumnType.JSON,
-            "VARCHAR2 WITH JSON": RustWrenEngineColumnType.JSON,
-            "BLOB WITH JSON": RustWrenEngineColumnType.JSON,
-            "CLOB WITH JSON": RustWrenEngineColumnType.JSON,
-        }
-        return switcher.get(normalized_type, RustWrenEngineColumnType.UNKNOWN)
+        # Use the module-level mapping table
+        mapped_type = ORACLE_TYPE_MAPPING.get(
+            normalized_type, RustWrenEngineColumnType.UNKNOWN
+        )
+
+        if mapped_type == RustWrenEngineColumnType.UNKNOWN:
+            logger.warning(f"Unknown Oracle data type: {data_type}")
+
+        return mapped_type

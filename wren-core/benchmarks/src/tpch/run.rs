@@ -3,10 +3,12 @@ use crate::util::options::CommonOpt;
 use crate::util::run::BenchmarkRun;
 use datafusion::common::Result;
 use datafusion::prelude::SessionContext;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use structopt::StructOpt;
+use wren_core::mdl::context::Mode;
 use wren_core::mdl::{transform_sql_with_ctx, AnalyzedWrenMDL};
 
 #[derive(Debug, StructOpt, Clone)]
@@ -49,7 +51,11 @@ impl RunOpt {
 
     async fn benchmark_query(&self, query_id: usize) -> Result<Vec<QueryResult>> {
         let ctx = SessionContext::new();
-        let mdl = Arc::new(AnalyzedWrenMDL::analyze(tpch_manifest())?);
+        let mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            tpch_manifest(),
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
         let mut millis = vec![];
         // run benchmark
         let mut query_results = vec![];
@@ -57,7 +63,14 @@ impl RunOpt {
             let start = Instant::now();
             let sql = &get_query_sql(query_id)?;
             for query in sql {
-                transform_sql_with_ctx(&ctx, Arc::clone(&mdl), &[], query).await?;
+                transform_sql_with_ctx(
+                    &ctx,
+                    Arc::clone(&mdl),
+                    &[],
+                    HashMap::new().into(),
+                    query,
+                )
+                .await?;
             }
 
             let elapsed = start.elapsed(); //.as_secs_f64() * 1000.0;

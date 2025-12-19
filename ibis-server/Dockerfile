@@ -53,27 +53,46 @@ RUN ACCEPT_EULA=Y apt-get -y install unixodbc-dev msodbcsql18
 RUN apt-get install -y default-libmysqlclient-dev
 
 # libpq-dev is required for psycopg2
-RUN apt-get -y install libpq-dev
-
-# Install Oracle Instant Client for Oracle database connections
-RUN apt-get install -y wget unzip libaio1 \
-    && wget https://download.oracle.com/otn_software/linux/instantclient/1923000/instantclient-basic-linux.x64-19.23.0.0.0dbru.zip \
-    && unzip instantclient-basic-linux.x64-19.23.0.0.0dbru.zip -d /opt/ \
-    && rm instantclient-basic-linux.x64-19.23.0.0.0dbru.zip \
-    && echo "/opt/instantclient_19_23" > /etc/ld.so.conf.d/oracle-instantclient.conf \
-    && ldconfig \
+RUN apt-get -y install libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH" \
-    REMOTE_FUNCTION_LIST_PATH=/resources/function_list \
-    LD_LIBRARY_PATH="/opt/instantclient_19_23:$LD_LIBRARY_PATH" \
-    ORACLE_HOME="/opt/instantclient_19_23"
+    PYTHONPATH="/app" \
+    REMOTE_FUNCTION_LIST_PATH=/app/resources/function_list \
+    REMOTE_WHITE_FUNCTION_LIST_PATH=/app/resources/white_function_list
+
+# Set working directory before copying files
+WORKDIR /app
 
 COPY --from=builder ${VIRTUAL_ENV} ${VIRTUAL_ENV}
-COPY app app
-COPY resources resources
+COPY app ./app/
+COPY resources ./resources/
+COPY notebooks ./notebooks/
+COPY wren/ ./wren/
 
-EXPOSE 8000
+# Copy pyproject.toml and poetry.lock for poetry to work
+COPY pyproject.toml poetry.lock ./
 
-CMD ["fastapi", "run"]
+# Install poetry in runtime stage
+RUN pip install poetry==1.8.3
+
+# Install jupyter dependencies
+RUN poetry install --without dev --with jupyter
+
+# runtime
+COPY --from=builder /app/.venv ${VIRTUAL_ENV}
+
+# Install Opentelemetry zero-instrumentation python
+RUN pip install opentelemetry-distro opentelemetry-exporter-otlp \
+    && opentelemetry-bootstrap -a install
+
+# Generate jupyter lab config
+RUN jupyter lab --generate-config --allow-root
+
+COPY entrypoint.sh ./
+RUN chmod +x ./entrypoint.sh
+
+EXPOSE 8000 8888
+
+ENTRYPOINT ["./entrypoint.sh"]

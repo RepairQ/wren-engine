@@ -172,16 +172,16 @@ async def test_query(client, manifest_str, minio):
         370,
         "O",
         "172799.49",
-        "1996-01-02 00:00:00.000000",
+        "1996-01-02",
         "1_370",
     ]
     assert result["dtypes"] == {
         "orderkey": "int32",
         "custkey": "int32",
-        "orderstatus": "object",
-        "totalprice": "float64",
-        "orderdate": "object",
-        "order_cust_key": "object",
+        "orderstatus": "string",
+        "totalprice": "decimal128(15, 2)",
+        "orderdate": "date32[day]",
+        "order_cust_key": "string",
     }
 
 
@@ -221,7 +221,7 @@ async def test_query_calculated_field(client, manifest_str, minio):
     ]
     assert result["dtypes"] == {
         "custkey": "int32",
-        "sum_totalprice": "float64",
+        "sum_totalprice": "decimal128(38, 2)",
     }
 
 
@@ -348,7 +348,10 @@ async def test_unsupported_format(client, minio):
         },
     )
     assert response.status_code == 422
-    assert response.text == "Failed to list files: Unsupported format: unsupported"
+    assert (
+        response.json()["message"]
+        == "Failed to list files: Unsupported format: unsupported"
+    )
 
 
 async def test_list_parquet_files(client, minio):
@@ -461,7 +464,7 @@ async def test_list_csv_files(client, minio):
     assert columns[13]["name"] == "c_timestamp"
     assert columns[13]["type"] == "TIMESTAMP"
     assert columns[14]["name"] == "c_timestamptz"
-    assert columns[14]["type"] == "TIMESTAMP"
+    assert columns[14]["type"] == "TIMESTAMPTZ"
     assert columns[15]["name"] == "c_tinyint"
     assert columns[15]["type"] == "INT64"
     assert columns[16]["name"] == "c_ubigint"
@@ -498,10 +501,8 @@ async def test_list_json_files(client, minio):
     columns = result[0]["columns"]
     assert columns[0]["name"] == "c_bigint"
     assert columns[0]["type"] == "INT64"
-    # `c_bit` is a string in json which value is `00000000000000000000000000000001`
-    # It's considered as a UUID by DuckDB json reader.
     assert columns[1]["name"] == "c_bit"
-    assert columns[1]["type"] == "UUID"
+    assert columns[1]["type"] == "STRING"
     assert columns[2]["name"] == "c_blob"
     assert columns[2]["type"] == "STRING"
     assert columns[3]["name"] == "c_boolean"

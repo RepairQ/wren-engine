@@ -2,6 +2,7 @@ import os
 
 import duckdb
 import opendal
+import pyarrow as pa
 from loguru import logger
 
 from app.model import (
@@ -9,8 +10,9 @@ from app.model import (
     LocalFileConnectionInfo,
     MinioFileConnectionInfo,
     S3FileConnectionInfo,
-    UnprocessableEntityError,
 )
+from app.model.connector import DuckDBConnector
+from app.model.error import ErrorCode, ErrorPhase, WrenError
 from app.model.metadata.dto import (
     Column,
     RustWrenEngineColumnType,
@@ -19,6 +21,34 @@ from app.model.metadata.dto import (
 )
 from app.model.metadata.metadata import Metadata
 from app.model.utils import init_duckdb_gcs, init_duckdb_minio, init_duckdb_s3
+
+DUCKDB_TYPE_MAPPING = {
+    "bigint": RustWrenEngineColumnType.INT64,
+    "bit": RustWrenEngineColumnType.INT2,
+    "blob": RustWrenEngineColumnType.BYTES,
+    "boolean": RustWrenEngineColumnType.BOOL,
+    "date": RustWrenEngineColumnType.DATE,
+    "double": RustWrenEngineColumnType.DOUBLE,
+    "float": RustWrenEngineColumnType.FLOAT,
+    "integer": RustWrenEngineColumnType.INT,
+    # TODO: Wren engine does not support HUGEINT. Map to INT64 for now.
+    "hugeint": RustWrenEngineColumnType.INT64,
+    "interval": RustWrenEngineColumnType.INTERVAL,
+    "json": RustWrenEngineColumnType.JSON,
+    "smallint": RustWrenEngineColumnType.INT2,
+    "time": RustWrenEngineColumnType.TIME,
+    "timestamp": RustWrenEngineColumnType.TIMESTAMP,
+    "timestamp with time zone": RustWrenEngineColumnType.TIMESTAMPTZ,
+    "tinyint": RustWrenEngineColumnType.INT2,
+    "ubigint": RustWrenEngineColumnType.INT64,
+    # TODO: Wren engine does not support UHUGEINT. Map to INT64 for now.
+    "uhugeint": RustWrenEngineColumnType.INT64,
+    "uinteger": RustWrenEngineColumnType.INT,
+    "usmallint": RustWrenEngineColumnType.INT2,
+    "utinyint": RustWrenEngineColumnType.INT2,
+    "uuid": RustWrenEngineColumnType.UUID,
+    "varchar": RustWrenEngineColumnType.STRING,
+}
 
 
 class ObjectStorageMetadata(Metadata):
@@ -79,7 +109,11 @@ class ObjectStorageMetadata(Metadata):
                     )
                     unique_tables[table_name].columns = columns
         except Exception as e:
-            raise UnprocessableEntityError(f"Failed to list files: {e!s}")
+            raise WrenError(
+                ErrorCode.GENERIC_USER_ERROR,
+                f"Failed to list files: {e!s}",
+                phase=ErrorPhase.METADATA_FETCHING,
+            )
 
         return list(unique_tables.values())
 
@@ -115,6 +149,14 @@ class ObjectStorageMetadata(Metadata):
             )
 
     def _to_column_type(self, col_type: str) -> RustWrenEngineColumnType:
+        """Transform DuckDB data type to RustWrenEngineColumnType.
+
+        Args:
+            col_type: The DuckDB data type string
+
+        Returns:
+            The corresponding RustWrenEngineColumnType
+        """
         if col_type.startswith("DECIMAL"):
             return RustWrenEngineColumnType.DECIMAL
 
@@ -125,36 +167,18 @@ class ObjectStorageMetadata(Metadata):
         # TODO: support array
         if col_type.endswith("[]"):
             return RustWrenEngineColumnType.UNKNOWN
+        # Convert to lowercase for comparison
+        normalized_type = col_type.lower()
 
-        # refer to https://duckdb.org/docs/sql/data_types/overview#general-purpose-data-types
-        switcher = {
-            "BIGINT": RustWrenEngineColumnType.INT64,
-            "BIT": RustWrenEngineColumnType.INT2,
-            "BLOB": RustWrenEngineColumnType.BYTES,
-            "BOOLEAN": RustWrenEngineColumnType.BOOL,
-            "DATE": RustWrenEngineColumnType.DATE,
-            "DOUBLE": RustWrenEngineColumnType.DOUBLE,
-            "FLOAT": RustWrenEngineColumnType.FLOAT,
-            "INTEGER": RustWrenEngineColumnType.INT,
-            # TODO: Wren engine does not support HUGEINT. Map to INT64 for now.
-            "HUGEINT": RustWrenEngineColumnType.INT64,
-            "INTERVAL": RustWrenEngineColumnType.INTERVAL,
-            "JSON": RustWrenEngineColumnType.JSON,
-            "SMALLINT": RustWrenEngineColumnType.INT2,
-            "TIME": RustWrenEngineColumnType.TIME,
-            "TIMESTAMP": RustWrenEngineColumnType.TIMESTAMP,
-            "TIMESTAMP WITH TIME ZONE": RustWrenEngineColumnType.TIMESTAMPTZ,
-            "TINYINT": RustWrenEngineColumnType.INT2,
-            "UBIGINT": RustWrenEngineColumnType.INT64,
-            # TODO: Wren engine does not support UHUGEINT. Map to INT64 for now.
-            "UHUGEINT": RustWrenEngineColumnType.INT64,
-            "UINTEGER": RustWrenEngineColumnType.INT,
-            "USMALLINT": RustWrenEngineColumnType.INT2,
-            "UTINYINT": RustWrenEngineColumnType.INT2,
-            "UUID": RustWrenEngineColumnType.UUID,
-            "VARCHAR": RustWrenEngineColumnType.STRING,
-        }
-        return switcher.get(col_type, RustWrenEngineColumnType.UNKNOWN)
+        # Use the module-level mapping table
+        mapped_type = DUCKDB_TYPE_MAPPING.get(
+            normalized_type, RustWrenEngineColumnType.UNKNOWN
+        )
+
+        if mapped_type == RustWrenEngineColumnType.UNKNOWN:
+            logger.warning(f"Unknown DuckDB data type: {col_type}")
+
+        return mapped_type
 
     def _get_connection(self):
         return duckdb.connect()
@@ -253,7 +277,7 @@ class GcsFileMetadata(ObjectStorageMetadata):
     def _get_connection(self):
         conn = duckdb.connect()
         init_duckdb_gcs(conn, self.connection_info)
-        logger.debug("Initialized duckdb minio")
+        logger.debug("Initialized duckdb gcs")
         return conn
 
     def _get_dal_operator(self):
@@ -271,3 +295,79 @@ class GcsFileMetadata(ObjectStorageMetadata):
             path = path[1:]
 
         return f"gs://{self.connection_info.bucket.get_secret_value()}/{path}"
+
+
+class DuckDBMetadata(ObjectStorageMetadata):
+    def __init__(self, connection_info: LocalFileConnectionInfo):
+        super().__init__(connection_info)
+        self.connection = DuckDBConnector(connection_info)
+
+    def get_table_list(self) -> list[Table]:
+        sql = """
+            SELECT
+                t.table_catalog,
+                t.table_schema,
+                t.table_name,
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.ordinal_position
+            FROM
+                information_schema.tables t
+            JOIN
+                information_schema.columns c
+                ON t.table_schema = c.table_schema
+                AND t.table_name = c.table_name
+            WHERE
+                t.table_type IN ('BASE TABLE', 'VIEW')
+                AND t.table_schema NOT IN ('information_schema', 'pg_catalog');
+            """
+        response = (
+            self.connection.query(sql, limit=None).to_pandas().to_dict(orient="records")
+        )
+
+        unique_tables = {}
+        for row in response:
+            # generate unique table name
+            schema_table = self._format_compact_table_name(
+                row["table_schema"], row["table_name"]
+            )
+            # init table if not exists
+            if schema_table not in unique_tables:
+                unique_tables[schema_table] = Table(
+                    name=schema_table,
+                    columns=[],
+                    properties=TableProperties(
+                        schema=row["table_schema"],
+                        catalog=row["table_catalog"],
+                        table=row["table_name"],
+                    ),
+                    primaryKey="",
+                )
+
+            # table exists, and add column to the table
+            unique_tables[schema_table].columns.append(
+                Column(
+                    name=row["column_name"],
+                    type=self._to_column_type(row["data_type"]),
+                    notNull=row["is_nullable"].lower() == "no",
+                    properties=None,
+                )
+            )
+        return list(unique_tables.values())
+
+    def _format_compact_table_name(self, schema: str, table: str):
+        return f"{schema}.{table}"
+
+    def get_constraints(self):
+        return []
+
+    def get_version(self):
+        df: pa.Table = self.connection.query("SELECT version()")
+        if df is None:
+            raise WrenError(
+                ErrorCode.GENERIC_USER_ERROR, "Failed to get DuckDB version"
+            )
+        if df.num_rows == 0:
+            raise WrenError(ErrorCode.GENERIC_USER_ERROR, "DuckDB version is empty")
+        return df.column(0).to_pylist()[0]

@@ -107,16 +107,16 @@ async def test_query(client, manifest_str, connection_info):
         370,
         "O",
         "172799.49",
-        "1996-01-02 00:00:00.000000",
+        "1996-01-02",
         "1_370",
     ]
     assert result["dtypes"] == {
         "orderkey": "int32",
         "custkey": "int32",
-        "orderstatus": "object",
-        "totalprice": "float64",
-        "orderdate": "object",
-        "order_cust_key": "object",
+        "orderstatus": "string",
+        "totalprice": "decimal128(15, 2)",
+        "orderdate": "date32[day]",
+        "order_cust_key": "string",
     }
 
 
@@ -154,7 +154,7 @@ async def test_query_calculated_field(client, manifest_str, connection_info):
     ]
     assert result["dtypes"] == {
         "custkey": "int32",
-        "sum_totalprice": "float64",
+        "sum_totalprice": "decimal128(38, 2)",
     }
 
 
@@ -245,7 +245,10 @@ async def test_unsupported_format(client):
         },
     )
     assert response.status_code == 422
-    assert response.text == "Failed to list files: Unsupported format: unsupported"
+    assert (
+        response.json()["message"]
+        == "Failed to list files: Unsupported format: unsupported"
+    )
 
 
 async def test_list_parquet_files(client):
@@ -362,7 +365,7 @@ async def test_list_csv_files(client):
     assert columns[13]["name"] == "c_timestamp"
     assert columns[13]["type"] == "TIMESTAMP"
     assert columns[14]["name"] == "c_timestamptz"
-    assert columns[14]["type"] == "TIMESTAMP"
+    assert columns[14]["type"] == "TIMESTAMPTZ"
     assert columns[15]["name"] == "c_tinyint"
     assert columns[15]["type"] == "INT64"
     assert columns[16]["name"] == "c_ubigint"
@@ -401,10 +404,8 @@ async def test_list_json_files(client):
     columns = result[0]["columns"]
     assert columns[0]["name"] == "c_bigint"
     assert columns[0]["type"] == "INT64"
-    # `c_bit` is a string in json which value is `00000000000000000000000000000001`
-    # It's considered as a UUID by DuckDB json reader.
     assert columns[1]["name"] == "c_bit"
-    assert columns[1]["type"] == "UUID"
+    assert columns[1]["type"] == "STRING"
     assert columns[2]["name"] == "c_blob"
     assert columns[2]["type"] == "STRING"
     assert columns[3]["name"] == "c_boolean"
@@ -447,3 +448,36 @@ async def test_list_json_files(client):
     assert columns[21]["type"] == "UUID"
     assert columns[22]["name"] == "c_varchar"
     assert columns[22]["type"] == "STRING"
+
+
+async def test_duckdb_metadata_list_tables(client):
+    response = await client.post(
+        url=f"{base_url}/metadata/tables",
+        json={
+            "connectionInfo": {
+                "url": "tests/resource/test_file_source",
+                "format": "duckdb",
+            },
+        },
+    )
+    assert response.status_code == 200
+
+    result = next(filter(lambda x: x["name"] == "main.customers", response.json()))
+    assert result["name"] == "main.customers"
+    assert result["primaryKey"] is not None
+    assert result["description"] is None
+    assert result["properties"] == {
+        "catalog": "jaffle_shop",
+        "schema": "main",
+        "table": "customers",
+        "path": None,
+    }
+    assert len(result["columns"]) == 7
+    assert result["columns"][1] == {
+        "name": "number_of_orders",
+        "nestedColumns": None,
+        "type": "INT64",
+        "notNull": False,
+        "description": None,
+        "properties": None,
+    }
