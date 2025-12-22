@@ -65,8 +65,9 @@ class Oracle(OriginalOracle):
             source = expression.this
             target_type = expression.to
 
-            # Check if we're casting to TIMESTAMP or DATE
-            if target_type and target_type.this in (exp.DataType.Type.TIMESTAMP, exp.DataType.Type.DATE):
+            # Check if we're casting to TIMESTAMP, TIMESTAMPTZ, or DATE
+            # TIMESTAMPTZ needs to be mapped to TIMESTAMP for Oracle 19c compatibility
+            if target_type and target_type.this in (exp.DataType.Type.TIMESTAMP, exp.DataType.Type.TIMESTAMPTZ, exp.DataType.Type.DATE):
                 # Check if source is a string literal
                 if isinstance(source, exp.Literal) and source.is_string:
                     literal_value = source.this
@@ -86,7 +87,8 @@ class Oracle(OriginalOracle):
                             return self.cast_sql(expression)
 
                         # Use TO_TIMESTAMP or TO_DATE with explicit format
-                        func_name = "TO_TIMESTAMP" if target_type.this == exp.DataType.Type.TIMESTAMP else "TO_DATE"
+                        # TIMESTAMPTZ is mapped to TIMESTAMP for Oracle 19c
+                        func_name = "TO_TIMESTAMP" if target_type.this in (exp.DataType.Type.TIMESTAMP, exp.DataType.Type.TIMESTAMPTZ) else "TO_DATE"
                         return f"{func_name}('{literal_value}', '{format_mask}')"
 
             # For all other cases, use default CAST behavior
